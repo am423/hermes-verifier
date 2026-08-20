@@ -28,36 +28,40 @@ the primary agent runs off a cliff.
   session: transcript view, composer, and the composer's own model catalog as the
   verifier model selector.
 
-## Repository layout (the `plugin/` folder is the installable package)
+## Repository layout (the repo root IS the installable package)
 
 ```
-hermes-verifier/
-├── plugin/               ← install root (~/.hermes/plugins/hermes-verifier/)
-│   ├── plugin.yaml       ← manifest: 4 hooks, llm.model_override capability, schema
-│   ├── __init__.py       ← register(ctx)
-│   ├── brief.py          ← VERIFIER.md / VERIFIER.yml discovery, @imports, prompts
-│   ├── delta.py          ← transcript delta extraction + redaction + finding-strip
-│   ├── guard.py          ← emission guard (normalize, phrase filter, dedupe, rate limit)
-│   ├── runtime.py        ← per-session verifier runtime, delivery, roster, events
-│   ├── commands.py       ← /verify slash command
-│   ├── dashboard/
-│   │   ├── manifest.json
-│   │   └── plugin_api.py ← REST + websocket backend (/api/plugins/hermes-verifier/)
-│   ├── desktop/
-│   │   └── plugin.js     ← Verifier Mode page (route /verifier)
-│   └── skills/hermes-verifier/SKILL.md
-├── tests/                ← 41 tests: guard, delta, runtime, roster, backlog, events
-├── docs/design.md        ← full architecture and behavior spec
-└── PLAN.md               ← milestone checklist
+hermes-verifier/               ← install root (~/.hermes/plugins/hermes-verifier/)
+├── plugin.yaml                ← manifest: 4 hooks, llm.model_override capability, schema
+├── __init__.py                ← register(ctx)
+├── brief.py                   ← VERIFIER.md / VERIFIER.yml discovery, @imports, prompts
+├── delta.py                   ← transcript delta extraction + redaction + finding-strip
+├── guard.py                   ← emission guard (normalize, phrase filter, dedupe, rate limit)
+├── runtime.py                 ← per-session verifier runtime, delivery, roster, events
+├── commands.py                ← /verify slash command
+├── dashboard/
+│   ├── manifest.json
+│   └── plugin_api.py          ← REST + websocket backend (/api/plugins/hermes-verifier/)
+├── desktop/
+│   └── plugin.js              ← Verifier Mode page (route /verifier)
+├── skills/hermes-verifier/SKILL.md
+├── tests/                     ← 41 tests: guard, delta, runtime, roster, backlog, events
+├── pytest.ini                 ← importlib mode: keeps pytest off the hyphenated root package
+├── docs/design.md             ← full architecture and behavior spec
+└── PLAN.md                    ← milestone checklist
 ```
+
+The docs/ and tests/ folders ride along inertly — Hermes imports only
+`__init__.py` and its submodules, and the install probe keys off
+`plugin.yaml` + `__init__.py` + `desktop/plugin.js` at this root.
 
 ## Install
 
-Clone and symlink the package, then enable it:
+Clone and symlink the repo itself, then enable it:
 
 ```bash
 git clone git@github.com:am423/hermes-verifier.git
-ln -s "$(pwd)/hermes-verifier/plugin" ~/.hermes/plugins/hermes-verifier
+ln -s "$(pwd)/hermes-verifier" ~/.hermes/plugins/hermes-verifier
 hermes plugins enable hermes-verifier
 # restart the gateway, then per session:
 #   /verify on
@@ -69,9 +73,9 @@ Or use the one-click install link from the Hermes desktop app:
 hermes://plugin/install?repo=am423/hermes-verifier&enable=1
 ```
 
-(The deep link probes what the repo ships; if its probe expects `plugin.yaml` at the
-repo root rather than under `plugin/`, restructure the repo accordingly first. The
-repo is private, so the link works for the owner only until it is made public.)
+(The repo is private, so the link works for the owner only until it is made
+public. The probe detects both halves at the repo root: agent via
+`plugin.yaml` + `__init__.py`, desktop via `desktop/plugin.js`.)
 
 ## Activating
 

@@ -8,14 +8,14 @@ slice exists as early as possible.
 
 - [x] Repository skeleton: README, PLAN, design doc, license, folder layout
 - [x] Private GitHub repository
-- [ ] CI smoke job: YAML parse of `plugin/plugin.yaml` (no runtime yet)
+- [ ] CI smoke job: YAML parse of `plugin.yaml` (no runtime yet)
 
 ## M1 — Verifier runtime (agent-side)
 
 Goal: the verifier sees every turn delta and can raise findings; findings reach the
 primary session through context injection. No UI yet — slash commands only.
 
-- [x] `plugin/plugin.yaml` manifest (hooks: `post_llm_call`, `pre_llm_call`,
+- [x] `plugin.yaml` manifest (hooks: `post_llm_call`, `pre_llm_call`,
       `pre_verify`, `on_session_reset`; capability: `llm.model_override`)
 - [x] Delta recorder: capture and render transcript deltas (assistant text, tool calls,
       tool results, reasoning markers) with secret redaction
