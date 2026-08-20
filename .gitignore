@@ -6,3 +6,5 @@ __pycache__/
 node_modules/
 *.log
 .hook_outputs/
+tests/_pkg/
+.pytest_cache/

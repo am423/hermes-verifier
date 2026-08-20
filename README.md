@@ -41,8 +41,12 @@ hermes-verifier/
 
 ## Status
 
-**Planning.** This repository currently contains the design and execution plan.
-Implementation starts at milestone 1 — see [PLAN.md](PLAN.md).
+**M1 implemented.** The agent-side verifier runtime is built, tested (29 tests),
+validated with `hermes plugins doctor`, and installed in this machine's Hermes.
+The desktop UI lands in milestone 3 — see [PLAN.md](PLAN.md).
+
+Activate after the next gateway restart: `/verify on` (session-scoped) or
+`plugins.entries.hermes-verifier.settings.enabled: true` (default on).
 
 ## License
 

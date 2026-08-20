@@ -1,0 +1,44 @@
+name: hermes-verifier
+version: 0.1.0
+description: >-
+  Attach an independent verifier model to your Hermes session: it reviews each
+  primary-agent turn delta, raises findings (note / caution / blocker), and
+  steers them back into the session before the primary agent goes wrong.
+author: "am423"
+license: MIT
+manifest_version: 2
+api_version: 1
+homepage: https://github.com/am423/hermes-verifier
+tags: [desktop, session, review, verifier]
+provides_hooks:
+  - post_llm_call
+  - pre_llm_call
+  - pre_verify
+  - on_session_reset
+capabilities:
+  - llm.model_override
+config_schema:
+  enabled:
+    type: bool
+    default: false
+    description: "Run the verifier after every primary turn. Default off; toggle per session with /verify on."
+  model:
+    type: str
+    default: ""
+    description: "Verifier model as 'provider/model' or a plain model id. Empty = the session's primary model."
+  sync_backlog:
+    type: str
+    default: "off"
+    description: "Catch-up pacing when the verifier falls behind: off|1|3|5. M1 ships off only."
+  immunity_turns:
+    type: int
+    default: 3
+    description: "Primary turns after an interrupting finding before another may interrupt."
+  max_delta_chars:
+    type: int
+    default: 20000
+    description: "Cap on the rendered transcript delta sent to the verifier."
+  blocker_steer:
+    type: bool
+    default: true
+    description: "Let a blocker finding keep a coding turn alive via the pre-verify gate."

@@ -427,13 +427,16 @@ All routes mount under `/api/plugins/hermes-verifier/`.
   consecutive quarantine emits a host warning, drops the batch, and resets the context
   to break the loop.
 
-## 14. Open questions (spiked during M1)
+## 14. Spikes — resolved during M1
 
-1. **Steering channel.** What is the cleanest Hermes-native way to inject an
-   interrupting caution/blocker into a live turn? Candidates: `pre_llm_call` context
-   injection (guaranteed next-step delivery), gateway session-message dispatch, or a
-   session event. `note` delivery already has a clean home in `pre_llm_call`.
-2. **`ctx.llm` surface.** Exact shape for model-override calls, streaming, and per-call
-   usage reporting — spike against the running gateway before building the verifier loop.
-3. **Plan-mode detection.** How a plugin observes plan mode from inside a hook payload,
-   to implement the preserve-as-card rule.
+1. **Steering channel.** Resolved: `pre_llm_call` returns `{"context": str}` which the
+   host injects into the next primary turn's user message (the note/caution path), and
+   the `pre_verify` hook accepts `{"action": "continue", "message": str}` to keep a
+   coding turn alive (the blocker path). Both verified against the installed agent core.
+2. **`ctx.llm` surface.** Resolved: `ctx.llm.complete_structured(instructions=…,
+   input=[{"type":"text","text":…}], json_schema=…, json_mode=True, system_prompt=…,
+   model=…, provider=…)` returns a result with `.parsed`, `.usage`, `.model`. Overrides
+   are trust-gated by `plugins.entries.<id>.llm.allow_model_override` (or the
+   `llm.model_override` capability); on denial the plugin degrades to the primary model.
+3. **Plan-mode detection.** Open. Not required for the M1 delivery paths; revisit when
+   the preserve-as-card rule is implemented.

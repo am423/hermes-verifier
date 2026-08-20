@@ -15,21 +15,25 @@ slice exists as early as possible.
 Goal: the verifier sees every turn delta and can raise findings; findings reach the
 primary session through context injection. No UI yet — slash commands only.
 
-- [ ] `plugin/plugin.yaml` manifest (hooks: `post_llm_call`, `post_tool_call`,
-      `on_session_start`, `on_session_reset`; capabilities: `llm.model_override`)
-- [ ] Delta recorder: capture and render transcript deltas (assistant text, tool calls,
+- [x] `plugin/plugin.yaml` manifest (hooks: `post_llm_call`, `pre_llm_call`,
+      `pre_verify`, `on_session_reset`; capability: `llm.model_override`)
+- [x] Delta recorder: capture and render transcript deltas (assistant text, tool calls,
       tool results, reasoning markers) with secret redaction
-- [ ] Verifier loop: single default verifier, model resolved from plugin settings /
-      `ctx.llm`, own append-only context
-- [ ] Finding tool: `raise_finding(note, severity)` with `note` / `caution` / `blocker`
-- [ ] Emission guard: normalization, content-free phrase filter, exact-text dedupe,
+- [x] Verifier loop: single default verifier, model resolved from plugin settings /
+      `ctx.llm.complete_structured`, own append-only context
+- [x] Finding channel: structured review envelope (`severity`/`finding`/`reasoning`)
+      instead of a registered model tool — keeps the primary toolset untouched
+- [x] Emission guard: normalization, content-free phrase filter, exact-text dedupe,
       one accepted finding per review cycle
-- [ ] Delivery: `note` → next step boundary via `pre_llm_call` injection;
-      `caution` / `blocker` → steering (mechanism spike — see design doc §9)
-- [ ] Reset semantics: compaction/session-switch re-prime, mid-session enable seeds
+- [x] Delivery: `note`/`caution` via `pre_llm_call` context injection (next step
+      boundary); `blocker` additionally steers via the `pre_verify` gate on coding turns
+      (spike #1 resolved)
+- [x] Reset semantics: compaction/session-switch re-prime, mid-session enable seeds
       cursor to current transcript length
-- [ ] Slash commands: `/verify`, `/verify on|off|status|dump`
-- [ ] Test: scripted session → assert findings JSONL emitted and injected
+- [x] Slash commands: `/verify`, `/verify on|off|status|dump`, `/verify reset`
+- [x] Test: 29 unit + integration tests (fake ctx), `hermes plugins doctor` clean,
+      installed + enabled in this machine's Hermes (`~/.hermes/plugins/hermes-verifier`)
+- [ ] Optional: real-session smoke test after the next gateway restart
 
 ## M2 — Backend API
 
@@ -66,9 +70,9 @@ Goal: the session-like screen.
 
 ## Risks / spikes
 
-| # | Risk | Where |
-|---|------|-------|
-| 1 | Mid-turn steering mechanism for `caution`/`blocker` may not exist as a first-class hook; may need gateway event / session message dispatch | M1 |
-| 2 | `ctx.llm` exact surface (model override, streaming) needs a spike against the running gateway | M1 |
+| # | Risk | Status |
+|---|------|--------|
+| 1 | Mid-turn steering mechanism for `caution`/`blocker` may not exist as a first-class hook | **Resolved** — `pre_verify` hook returns `{"action":"continue","message":…}` to keep coding turns alive; `pre_llm_call` returns `{"context":…}` for next-turn injection |
+| 2 | `ctx.llm` exact surface (model override, streaming) needs a spike against the running gateway | **Resolved** — `ctx.llm.complete_structured(…, json_schema=…)` with trust-gated `model=`/`provider=` overrides (`plugins.entries.<id>.llm.allow_model_override`) |
 | 3 | Desktop transcript fidelity: matching the native session screen look is component-by-component; core session components may not be exported to the SDK | M3 |
-| 4 | Secret redaction parity: verifier must never see raw secrets that the primary's transcript already obfuscates | M1 |
+| 4 | Secret redaction parity: verifier must never see raw secrets that the primary's transcript already obfuscates | M1 ships a regex scrubber + long-token collapse; parity with the host obfuscator is a hardening item |
