@@ -57,24 +57,37 @@ def _status_lines() -> List[str]:
 
     for key in sorted(sessions):
         sess = sessions[key]
-        stats = sess["stats"]
         active = "on " if sess["active"] else "off"
+        reviewing = " [reviewing]" if sess.get("reviewing") else ""
+        verifiers = sess.get("verifiers") or {}
+        agg = {"reviews": 0, "findings": 0, "notes": 0, "cautions": 0,
+               "blockers": 0, "input_tokens": 0, "output_tokens": 0,
+               "cost_usd": 0.0}
+        models = []
+        for slug, verifier in sorted(verifiers.items()):
+            stats = verifier.get("stats") or {}
+            for field in agg:
+                agg[field] += stats.get(field, 0) or 0
+            if stats.get("model"):
+                models.append(stats["model"])
         pending = ""
-        if sess["pending"]:
-            pending = f" | pending: {sess['pending']['severity']}"
-        last_err = ""
-        if stats.get("last_error"):
-            last_err = f" | error: {stats['last_error'][:80]}"
+        for slug, verifier in sorted(verifiers.items()):
+            if verifier.get("pending"):
+                pending = f" | pending: {verifier['pending']['severity']} ({slug})"
+                break
+        last_err = sess.get("last_error") or ""
+        if last_err:
+            last_err = f" | error: {last_err[:80]}"
         line = (
-            f"  {sess['session_id'][:28]:<28} {active} | reviews: {stats['reviews']} "
-            f"| findings: {stats['findings']} (n:{stats['notes']} "
-            f"c:{stats['cautions']} b:{stats['blockers']}) "
-            f"| tokens: {stats['input_tokens'] + stats['output_tokens']} "
-            f"| cost: {_fmt_cost(stats['cost_usd'])}"
+            f"  {sess['session_id'][:28]:<28} {active} | reviews: {agg['reviews']} "
+            f"| findings: {agg['findings']} (n:{agg['notes']} "
+            f"c:{agg['cautions']} b:{agg['blockers']}) "
+            f"| tokens: {agg['input_tokens'] + agg['output_tokens']} "
+            f"| cost: {_fmt_cost(agg['cost_usd'])}"
         )
-        lines.append(line + pending + last_err)
-        if stats.get("model"):
-            lines.append(f"      verifier model: {stats['model']}")
+        lines.append(line + reviewing + pending + last_err)
+        if models:
+            lines.append(f"      verifier models: {', '.join(models[:3])}")
     return lines
 
 

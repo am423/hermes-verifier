@@ -1,10 +1,19 @@
 """Per-session verifier runtime: review loop, delivery, persistence.
 
 The verifier is a passive reviewer. It reviews each primary turn delta in a
-background thread (never blocking the primary), raises at most one finding
-per review, and delivers accepted findings back through the next turn's
-context injection (``pre_llm_call``) or — for blockers on coding turns — the
+background thread (never blocking the primary, unless the catch-up window
+``sync_backlog`` is armed), raises at most one finding per verifier per
+review, and delivers accepted findings back through the next turn's context
+injection (``pre_llm_call``) or — for blockers on coding turns — the
 ``pre_verify`` steer gate.
+
+Verifiers come from two places:
+
+* the **default verifier** — one per session, model from plugin settings;
+* the **roster** — ``VERIFIER.yml`` entries with their own name, enable flag,
+  model, tool grant (validated, not yet executable), and specialization
+  prompt. Each entry runs as its own verifier with its own emission guard,
+  stats, and JSONL log.
 
 Hermes imports are lazy (inside functions) so this module imports cleanly in
 tests and under the plugin loader.
@@ -14,20 +23,18 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import brief, delta as delta_mod, guard as guard_mod
 
 logger = logging.getLogger("hermes-verifier")
 
 PLUGIN_ID = "hermes-verifier"
-PLUGIN_NAME = "hermes-verifier"
 DEFAULT_VERIFIER = "default"
 
 REVIEW_SCHEMA = {
@@ -60,39 +67,118 @@ _SESSIONS: Dict[str, "SessionVerifier"] = {}
 _MAX_SESSIONS = 64
 _MAX_INFLIGHT = 2
 _INFLIGHT = threading.BoundedSemaphore(_MAX_INFLIGHT)
+_BACKLOG_WAIT_CAP = 30.0
+_BACKLOG_POLL = 0.1
+
+# Event log for the dashboard websocket + UI: bounded ring with sequence ids.
+EVENT_LOG: "List[Dict[str, Any]]" = []
+_EVENT_SEQ = 0
+_EVENT_LOCK = threading.Lock()
 
 # Facade bound at register() time: PluginContext (get_config / llm / state).
 _CTX: Any = None
 # Injectable overrides for tests.
 _DATA_DIR_OVERRIDE: Optional[Path] = None
-_REVIEW_FN_OVERRIDE = None
+_REVIEW_FN_OVERRIDE: Optional[Callable] = None
+_ROSTER_OVERRIDE: Optional[List[Dict[str, Any]]] = None
 _RUNTIME_OVERRIDES: Dict[str, Any] = {}  # /verify on|off session-scoped toggles
 _RECENT_SESSION: Optional[str] = None
+
+
+def publish_event(kind: str, data: Dict[str, Any]) -> None:
+    global _EVENT_SEQ
+    with _EVENT_LOCK:
+        _EVENT_SEQ += 1
+        EVENT_LOG.append({"seq": _EVENT_SEQ, "kind": kind, "ts": time.time(), **data})
+        while len(EVENT_LOG) > 200:
+            EVENT_LOG.pop(0)
+
+
+def events_after(seq: int) -> List[Dict[str, Any]]:
+    with _EVENT_LOCK:
+        return [e for e in EVENT_LOG if e["seq"] > seq]
+
+
+def last_event_seq() -> int:
+    with _EVENT_LOCK:
+        return _EVENT_SEQ
+
+
+@dataclass
+class Verifier:
+    """One reviewer attached to a session (default or roster entry)."""
+
+    slug: str
+    name: str
+    model: str = ""          # "provider/model" override; "" = inherit default
+    tools: List[str] = field(default_factory=list)
+    instructions: str = ""
+    shared_instructions: str = ""
+    guard: guard_mod.EmissionGuard = field(default_factory=guard_mod.EmissionGuard)
+    pending: Optional[Dict[str, Any]] = None
+    stats: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "reviews": 0, "findings": 0, "blockers": 0, "cautions": 0,
+            "notes": 0, "input_tokens": 0, "output_tokens": 0,
+            "cost_usd": 0.0, "model": "",
+        }
+    )
+
+    def reset(self) -> None:
+        self.guard.reset()
+        self.pending = None
 
 
 @dataclass
 class SessionVerifier:
     session_id: str
     cursor_len: Optional[int] = None
-    guard: guard_mod.EmissionGuard = field(default_factory=guard_mod.EmissionGuard)
-    pending: Optional[Dict[str, Any]] = None
+    verifiers: Dict[str, Verifier] = field(default_factory=dict)
     immunity_left: int = 0
-    stats: Dict[str, Any] = field(
-        default_factory=lambda: {
-            "reviews": 0, "findings": 0, "blockers": 0, "cautions": 0,
-            "notes": 0, "input_tokens": 0, "output_tokens": 0,
-            "cost_usd": 0.0, "model": "", "last_error": "",
-        }
-    )
+    backlog: int = 0
+    reviewing: bool = False
+    consecutive_failures: int = 0
     last_error: str = ""
     last_review_ts: float = 0.0
+    roster_revision: int = 0
+
+    def ensure_verifiers(self, roster: List[Dict[str, Any]]) -> None:
+        """Rebuild the verifier list when the roster changes."""
+        entries = {e.get("slug") or e.get("name") for e in roster if e.get("enabled", True)}
+        entries.add(DEFAULT_VERIFIER)
+        for slug in list(self.verifiers):
+            if slug not in entries:
+                del self.verifiers[slug]
+        if DEFAULT_VERIFIER not in self.verifiers:
+            self.verifiers[DEFAULT_VERIFIER] = Verifier(
+                slug=DEFAULT_VERIFIER, name="Default",
+            )
+        for entry in roster:
+            slug = str(entry.get("slug") or entry.get("name"))
+            if not entry.get("enabled", True):
+                self.verifiers.pop(slug, None)
+                continue
+            verifier = self.verifiers.get(slug)
+            if verifier is None:
+                verifier = Verifier(slug=slug, name=str(entry.get("name", slug)))
+                self.verifiers[slug] = verifier
+            verifier.name = str(entry.get("name", slug))
+            verifier.model = str(entry.get("model") or "")
+            verifier.tools = list(entry.get("tools") or [])
+            verifier.instructions = str(entry.get("instructions") or "")
+            verifier.shared_instructions = str(entry.get("shared_instructions") or "")
+
+    def enabled_verifiers(self) -> List[Verifier]:
+        return [v for v in self.verifiers.values()]
 
     def reset(self) -> None:
         """Re-prime after compaction / session reset / /new."""
         self.cursor_len = None
-        self.guard.reset()
-        self.pending = None
         self.immunity_left = 0
+        self.backlog = 0
+        self.reviewing = False
+        for verifier in self.verifiers.values():
+            verifier.reset()
 
 
 def _session_key(session_id: Any) -> str:
@@ -105,10 +191,10 @@ def _get_state(session_id: Any, create: bool = True) -> Optional[SessionVerifier
         state = _SESSIONS.get(key)
         if state is None and create:
             if len(_SESSIONS) >= _MAX_SESSIONS:
-                # Evict the least-recently-created tracked session.
                 oldest = next(iter(_SESSIONS))
                 _SESSIONS.pop(oldest, None)
             state = SessionVerifier(session_id=key)
+            state.ensure_verifiers(discover_roster())
             _SESSIONS[key] = state
         return state
 
@@ -116,6 +202,16 @@ def _get_state(session_id: Any, create: bool = True) -> Optional[SessionVerifier
 def bind_ctx(ctx: Any) -> None:
     global _CTX
     _CTX = ctx
+
+
+def discover_roster() -> List[Dict[str, Any]]:
+    if _ROSTER_OVERRIDE is not None:
+        return list(_ROSTER_OVERRIDE)
+    try:
+        return brief.load_roster()
+    except Exception as exc:  # pragma: no cover - never break the loop
+        logger.warning("roster discovery failed: %s", exc)
+        return []
 
 
 def subsystem_enabled(session_id: Any) -> bool:
@@ -155,8 +251,8 @@ def data_dir() -> Path:
     return plugin_data_dir(PLUGIN_ID)
 
 
-def _log_path(session_id: str) -> Path:
-    return data_dir() / f"verify.{_slug_session(session_id)}.jsonl"
+def _log_path(session_id: str, slug: str) -> Path:
+    return data_dir() / f"verify.{_slug_session(session_id)}.{slug}.jsonl"
 
 
 def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
@@ -168,22 +264,39 @@ def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
         logger.warning("failed to append %s: %s", path, exc)
 
 
+def read_jsonl_tail(path: Path, limit: int = 100) -> List[Dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+    except OSError:
+        return []
+    records: List[Dict[str, Any]] = []
+    for line in lines[-limit:]:
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
 # ---------------------------------------------------------------------------
 # Review loop
 # ---------------------------------------------------------------------------
 
-def _render_finding(finding: Dict[str, Any]) -> str:
+def _render_finding(slug: str, finding: Dict[str, Any]) -> str:
     severity = finding.get("severity", "note")
     text = str(finding.get("finding", "")).strip()
+    attrs = [f'verifier="{slug}"', f'severity="{severity}"']
+    if slug == DEFAULT_VERIFIER:
+        attrs = [f'severity="{severity}"']
     return (
-        f'<finding verifier="{DEFAULT_VERIFIER}" severity="{severity}" '
-        f'guidance="weigh, don\'t blindly obey">\n{text}\n</finding>'
+        f"<finding {' '.join(attrs)} guidance=\"weigh, don't blindly obey\">\n"
+        f"{text}\n</finding>"
     )
 
 
-def _resolve_model(ctx: Any) -> tuple:
-    """Return (provider, model) overrides, or (None, None) for primary model."""
-    raw = str(_config(ctx, "model", "") or "").strip()
+def _split_model(raw: str) -> tuple:
+    """Return (provider, model) from a 'provider/model' selector."""
+    raw = (raw or "").strip()
     if not raw:
         return None, None
     if "/" in raw:
@@ -192,116 +305,165 @@ def _resolve_model(ctx: Any) -> tuple:
     return None, raw
 
 
-def _run_review(state: SessionVerifier, delta_text: str) -> None:
-    """One review cycle. Runs in a background thread; never raises."""
+def _resolve_model_for(ctx: Any, verifier: Verifier) -> tuple:
+    """Per-verifier model: roster entry wins, else the plugin setting."""
+    selector = verifier.model or str(_config(ctx, "model", "") or "")
+    return _split_model(selector)
+
+
+def _call_structured(ctx: Any, *, system_prompt: str, instructions: str,
+                     input_text: str, provider: Optional[str],
+                     model: Optional[str]) -> Any:
+    from agent.plugin_llm import PluginLlmTrustError  # noqa: F401
+
+    kwargs: Dict[str, Any] = dict(
+        instructions=instructions,
+        input=[{"type": "text", "text": input_text}],
+        json_schema=REVIEW_SCHEMA,
+        json_mode=True,
+        schema_name="verifier_review",
+        system_prompt=system_prompt,
+        purpose="hermes-verifier review",
+        timeout=120.0,
+    )
+    if provider:
+        kwargs["provider"] = provider
+    if model:
+        kwargs["model"] = model
+    return ctx.llm.complete_structured(**kwargs)
+
+
+def _record_and_deliver(state: SessionVerifier, verifier: Verifier,
+                        parsed: Dict[str, Any], accepted: bool,
+                        usage: Any, delta_excerpt: str = "") -> None:
+    severity = str(parsed.get("severity") or "none").strip().lower()
+    finding_text = str(parsed.get("finding") or "").strip()
+    reasoning = str(parsed.get("reasoning") or "").strip()
+    record = {
+        "ts": time.time(),
+        "session_id": state.session_id,
+        "verifier": verifier.slug,
+        "severity": severity,
+        "finding": finding_text,
+        "reasoning": reasoning,
+        "accepted": accepted,
+        "model": verifier.stats["model"],
+        "delta_excerpt": delta_excerpt[:400],
+        "usage": {
+            "input_tokens": getattr(usage, "input_tokens", 0),
+            "output_tokens": getattr(usage, "output_tokens", 0),
+            "cost_usd": getattr(usage, "cost_usd", None),
+        } if usage is not None else {},
+    }
+    _append_jsonl(_log_path(state.session_id, verifier.slug), record)
+    publish_event("review", {"session_id": state.session_id,
+                             "verifier": verifier.slug, "severity": severity,
+                             "finding": finding_text[:240], "accepted": accepted})
+    if not accepted:
+        return
+    verifier.stats["findings"] += 1
+    verifier.stats[severity + "s"] = verifier.stats.get(severity + "s", 0) + 1
+    verifier.pending = {
+        "severity": severity,
+        "finding": finding_text,
+        "reasoning": reasoning,
+    }
+    publish_event("finding", {"session_id": state.session_id,
+                              "verifier": verifier.slug, "severity": severity,
+                              "finding": finding_text[:240]})
+    logger.info(
+        "verifier %s raised %s finding for %s: %s",
+        verifier.slug, severity, state.session_id, finding_text[:120],
+    )
+
+
+def _plugin_llm_trust_error_type() -> Any:
+    try:
+        from agent.plugin_llm import PluginLlmTrustError
+
+        return PluginLlmTrustError
+    except Exception:
+        return None
+
+
+def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> None:
     ctx = _CTX
     if ctx is None:
         return
+    trust_error_type = _plugin_llm_trust_error_type()
+    verifier.guard.begin_cycle()
+    provider, model = _resolve_model_for(ctx, verifier)
+    try:
+        system_prompt = brief.build_system_prompt(
+            extra_instructions=verifier.shared_instructions + "\n\n" + verifier.instructions
+        )
+        result = _call_structured(
+            ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
+            input_text=delta_text, provider=provider, model=model,
+        )
+    except Exception as exc:
+        cls = type(exc).__name__
+        if trust_error_type is not None and isinstance(exc, trust_error_type):
+            hint = (
+                "model override denied — set plugins.entries.hermes-verifier."
+                "llm.allow_model_override: true (or grant the llm.model_override "
+                "capability) to use the configured verifier model"
+            )
+        else:
+            hint = str(exc)
+        state.last_error = f"{cls}: {hint}"[:300]
+        state.consecutive_failures += 1
+        publish_event("error", {"session_id": state.session_id,
+                                "verifier": verifier.slug, "error": state.last_error})
+        logger.warning("verifier %s review failed for %s: %s",
+                       verifier.slug, state.session_id, hint)
+        return
+
+    state.consecutive_failures = 0
+    state.last_error = ""
+    usage = getattr(result, "usage", None)
+    if usage is not None:
+        verifier.stats["input_tokens"] += int(getattr(usage, "input_tokens", 0) or 0)
+        verifier.stats["output_tokens"] += int(getattr(usage, "output_tokens", 0) or 0)
+        cost = getattr(usage, "cost_usd", None)
+        if cost:
+            verifier.stats["cost_usd"] += float(cost)
+    verifier.stats["model"] = getattr(result, "model", "") or ""
+    verifier.stats["reviews"] += 1
+    state.last_review_ts = time.time()
+
+    parsed = getattr(result, "parsed", None)
+    if not isinstance(parsed, dict):
+        logger.debug("verifier %s returned non-JSON for %s", verifier.slug, state.session_id)
+        return
+    severity = str(parsed.get("severity") or "none").strip().lower()
+    finding_text = str(parsed.get("finding") or "").strip()
+    if severity == "none" or not finding_text:
+        return
+    accepted = verifier.guard.accept(severity, finding_text)
+    _record_and_deliver(state, verifier, parsed, accepted, usage,
+                        delta_excerpt=delta_text)
+
+
+def _run_review(state: SessionVerifier, delta_text: str) -> None:
+    """One review cycle for every enabled verifier. Background thread."""
+    if _CTX is None:
+        return
     if not _INFLIGHT.acquire(blocking=False):
-        # Verifier already busy elsewhere; skip this delta rather than queue.
         logger.debug("verifier busy; skipping delta for %s", state.session_id)
         return
     try:
-        state.guard.begin_cycle()
-        provider, model = _resolve_model(ctx)
-        try:
-            from agent.plugin_llm import PluginLlmTrustError  # noqa: F401
-        except Exception:
-            PluginLlmTrustError = None  # type: ignore[assignment]
-
-        try:
-            system_prompt = brief.build_system_prompt()
-            llm = ctx.llm
-            kwargs: Dict[str, Any] = dict(
-                instructions=brief.REVIEW_TASK,
-                input=[{"type": "text", "text": delta_text}],
-                json_schema=REVIEW_SCHEMA,
-                json_mode=True,
-                schema_name="verifier_review",
-                system_prompt=system_prompt,
-                purpose="hermes-verifier review",
-                timeout=120.0,
-            )
-            if provider:
-                kwargs["provider"] = provider
-            if model:
-                kwargs["model"] = model
-            result = llm.complete_structured(**kwargs)
-        except Exception as exc:
-            # Trust-gate failures and provider errors both land here: record,
-            # drop the batch, never stall the primary.
-            cls = type(exc).__name__
-            if PluginLlmTrustError is not None and isinstance(exc, PluginLlmTrustError):
-                hint = (
-                    "model override denied — set plugins.entries.hermes-verifier."
-                    "llm.allow_model_override: true (or grant the llm.model_override "
-                    "capability) to use the configured verifier model"
-                )
-            else:
-                hint = str(exc)
-            state.last_error = f"{cls}: {hint}"[:300]
-            state.stats["last_error"] = state.last_error
-            logger.warning("verifier review failed for %s: %s", state.session_id, hint)
-            return
-
-        parsed = getattr(result, "parsed", None)
-        usage = getattr(result, "usage", None)
-        if usage is not None:
-            state.stats["input_tokens"] += int(getattr(usage, "input_tokens", 0) or 0)
-            state.stats["output_tokens"] += int(getattr(usage, "output_tokens", 0) or 0)
-            cost = getattr(usage, "cost_usd", None)
-            if cost:
-                state.stats["cost_usd"] += float(cost)
-        state.stats["model"] = getattr(result, "model", "") or ""
-        state.stats["reviews"] += 1
-        state.last_review_ts = time.time()
-        state.last_error = ""
-
-        if not isinstance(parsed, dict):
-            logger.debug("verifier returned non-JSON for %s", state.session_id)
-            return
-
-        severity = str(parsed.get("severity") or "none").strip().lower()
-        finding_text = str(parsed.get("finding") or "").strip()
-        reasoning = str(parsed.get("reasoning") or "").strip()
-        if severity == "none" or not finding_text:
-            return
-
-        accepted = state.guard.accept(severity, finding_text)
-        record = {
-            "ts": time.time(),
-            "session_id": state.session_id,
-            "verifier": DEFAULT_VERIFIER,
-            "severity": severity,
-            "finding": finding_text,
-            "reasoning": reasoning,
-            "accepted": accepted,
-            "model": state.stats["model"],
-            "usage": {
-                "input_tokens": getattr(usage, "input_tokens", 0),
-                "output_tokens": getattr(usage, "output_tokens", 0),
-                "cost_usd": getattr(usage, "cost_usd", None),
-            } if usage is not None else {},
-        }
-        _append_jsonl(_log_path(state.session_id), record)
-
-        if not accepted:
-            return
-
-        state.stats["findings"] += 1
-        state.stats.setdefault(severity + "s", 0)
-        state.stats[severity + "s"] += 1
-        finding = {
-            "severity": severity,
-            "finding": finding_text,
-            "reasoning": reasoning,
-        }
         with _LOCK:
-            state.pending = finding
-        logger.info(
-            "verifier raised %s finding for %s: %s",
-            severity, state.session_id, finding_text[:120],
-        )
+            state.reviewing = True
+        publish_event("review_started", {"session_id": state.session_id})
+        try:
+            for verifier in state.enabled_verifiers():
+                _review_one(state, verifier, delta_text)
+        finally:
+            with _LOCK:
+                state.reviewing = False
+                state.backlog = max(0, state.backlog - 1)
+            publish_event("review_finished", {"session_id": state.session_id})
     finally:
         _INFLIGHT.release()
 
@@ -310,11 +472,88 @@ def _schedule_review(state: SessionVerifier, delta_text: str) -> None:
     if _REVIEW_FN_OVERRIDE is not None:
         _REVIEW_FN_OVERRIDE(state, delta_text)
         return
+    with _LOCK:
+        state.backlog += 1
     thread = threading.Thread(
         target=_run_review, args=(state, delta_text),
         name=f"hermes-verifier:{state.session_id[:24]}", daemon=True,
     )
     thread.start()
+
+
+# ---------------------------------------------------------------------------
+# Catch-up window (sync_backlog)
+# ---------------------------------------------------------------------------
+
+def _backlog_wait(state: SessionVerifier, threshold: Optional[int]) -> None:
+    """Optionally pace the primary turn while the verifier catches up.
+
+    Only the primary's own turn boundary calls this; the wait is capped so a
+    failing verifier can never stall the session. A verifier in a failure
+    streak releases waiters immediately.
+    """
+    if not threshold or threshold < 1:
+        return
+    deadline = time.monotonic() + _BACKLOG_WAIT_CAP
+    while time.monotonic() < deadline:
+        with _LOCK:
+            backlog = state.backlog
+            failing = state.consecutive_failures >= 3
+        if backlog < threshold or failing:
+            return
+        time.sleep(_BACKLOG_POLL)
+
+
+# ---------------------------------------------------------------------------
+# Ask channel (desktop composer → verifier)
+# ---------------------------------------------------------------------------
+
+def ask_verifier(session_id: Any, question: str) -> Dict[str, Any]:
+    """Send the verifier a direct question. Returns a structured answer."""
+    ctx = _CTX
+    if ctx is None:
+        return {"ok": False, "error": "verifier backend not loaded"}
+    state = _get_state(session_id, create=False)
+    if state is None:
+        return {"ok": False, "error": "no active verifier session (run a turn first)"}
+    verifier = state.verifiers.get(DEFAULT_VERIFIER)
+    if verifier is None:
+        return {"ok": False, "error": "default verifier missing"}
+    if not _INFLIGHT.acquire(blocking=False):
+        return {"ok": False, "error": "verifier busy; try again shortly"}
+    try:
+        provider, model = _resolve_model_for(ctx, verifier)
+        system_prompt = brief.build_system_prompt(
+            extra_instructions=verifier.shared_instructions + "\n\n" + verifier.instructions
+        )
+        try:
+            result = _call_structured(
+                ctx, system_prompt=system_prompt,
+                instructions=f"Answer this question about the session:\n\n{question}",
+                input_text="(direct question; no transcript delta provided)",
+                provider=provider, model=model,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+        usage = getattr(result, "usage", None)
+        record = {
+            "ts": time.time(), "session_id": state.session_id,
+            "verifier": verifier.slug, "kind": "ask",
+            "question": question[:1000],
+            "answer": getattr(result, "text", "")[:4000],
+            "usage": {
+                "input_tokens": getattr(usage, "input_tokens", 0),
+                "output_tokens": getattr(usage, "output_tokens", 0),
+            } if usage is not None else {},
+        }
+        _append_jsonl(_log_path(state.session_id, verifier.slug), record)
+        return {
+            "ok": True,
+            "answer": getattr(result, "text", ""),
+            "model": getattr(result, "model", "") or "",
+        }
+    finally:
+        _INFLIGHT.release()
 
 
 # ---------------------------------------------------------------------------
@@ -350,29 +589,34 @@ def handle_post_llm_call(
         if not delta_text:
             return
         _schedule_review(state, delta_text)
+        sync = str(_config(_CTX, "sync_backlog", "off") or "off").strip()
+        if sync.isdigit():
+            _backlog_wait(state, int(sync))
     except Exception as exc:  # pragma: no cover - defense in depth
         logger.warning("post_llm_call handler failed: %s", exc)
 
 
 def handle_pre_llm_call(session_id: Any = "", **kwargs: Any) -> Optional[Dict[str, str]]:
-    """Deliver a pending finding into the next primary turn's context."""
+    """Deliver pending findings into the next primary turn's context."""
     if not subsystem_enabled(session_id):
         return None
     state = _get_state(session_id, create=False)
     if state is None:
         return None
     with _LOCK:
-        finding = state.pending
-        state.pending = None
-    if finding is None:
+        pending = {slug: v.pending for slug, v in state.verifiers.items()
+                   if v.pending is not None}
+        for verifier in state.verifiers.values():
+            verifier.pending = None
+    if not pending:
         return None
-    severity = finding.get("severity", "note")
-    # Interrupting delivery arms the immunity cooldown.
-    if severity in {"caution", "blocker"}:
+    severities = {f.get("severity", "note") for f in pending.values()}
+    if severities & {"caution", "blocker"}:
         state.immunity_left = int(_config(_CTX, "immunity_turns", 3) or 3)
     else:
         state.immunity_left = max(0, state.immunity_left - 1)
-    return {"context": _render_finding(finding)}
+    blocks = [_render_finding(slug, finding) for slug, finding in pending.items()]
+    return {"context": "\n\n".join(blocks)}
 
 
 def handle_pre_verify(session_id: Any = "", **kwargs: Any) -> Optional[Dict[str, str]]:
@@ -388,16 +632,24 @@ def handle_pre_verify(session_id: Any = "", **kwargs: Any) -> Optional[Dict[str,
     if state is None:
         return None
     with _LOCK:
-        finding = state.pending
-        if finding is None or finding.get("severity") != "blocker":
+        blocker: Optional[Dict[str, Any]] = None
+        blocker_verifier: Optional[Verifier] = None
+        for verifier in state.enabled_verifiers():
+            if verifier.pending and verifier.pending.get("severity") == "blocker":
+                blocker = verifier.pending
+                verifier.pending = None
+                blocker_verifier = verifier
+                break
+        if blocker is None:
             return None
         if state.immunity_left > 0:
-            # Not allowed to interrupt; finding stays pending and rides the
+            # Not allowed to interrupt; the finding stays pending and rides the
             # next pre_llm_call injection instead.
+            if blocker_verifier is not None:
+                blocker_verifier.pending = blocker
             return None
-        state.pending = None
         state.immunity_left = int(_config(_CTX, "immunity_turns", 3) or 3)
-    text = str(finding.get("finding", "")).strip()
+    text = str(blocker.get("finding", "")).strip()
     return {
         "action": "continue",
         "message": (
@@ -414,24 +666,62 @@ def handle_session_reset(session_id: Any = "", **kwargs: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Status / dump helpers (shared with the slash command)
+# Settings writer (desktop model dropdown)
+# ---------------------------------------------------------------------------
+
+def set_model(value: str) -> bool:
+    """Persist the default verifier model through the plugin settings namespace."""
+    cleaned = (value or "").strip()
+    if _CTX is not None:
+        try:
+            _CTX.set_config("model", cleaned)
+            return True
+        except Exception as exc:
+            logger.warning("ctx.set_config('model') failed: %s", exc)
+    try:  # fallback: write config directly (gateway dashboard context)
+        from hermes_cli import config as config_mod
+
+        partial = {
+            "plugins": {"entries": {PLUGIN_ID: {"settings": {"model": cleaned}}}}
+        }
+        full_path = ("plugins", "entries", PLUGIN_ID, "settings", "model")
+        config_mod.save_config(partial, preserve_keys={full_path}, merge_existing=True)
+        return True
+    except Exception as exc:
+        logger.warning("direct config write for model failed: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Status / dump helpers (shared with the slash command + dashboard)
 # ---------------------------------------------------------------------------
 
 def snapshot() -> Dict[str, Any]:
     with _LOCK:
-        sessions = {
-            key: {
+        sessions = {}
+        for key, st in _SESSIONS.items():
+            verifiers = {}
+            for slug, verifier in st.verifiers.items():
+                verifiers[slug] = {
+                    "name": verifier.name,
+                    "model": verifier.model,
+                    "tools": list(verifier.tools),
+                    "stats": dict(verifier.stats),
+                    "pending": verifier.pending,
+                }
+            sessions[key] = {
                 "session_id": st.session_id,
                 "active": subsystem_enabled(st.session_id),
-                "stats": dict(st.stats),
-                "pending": st.pending,
+                "reviewing": st.reviewing,
+                "backlog": st.backlog,
                 "immunity_left": st.immunity_left,
+                "last_error": st.last_error,
+                "verifiers": verifiers,
             }
-            for key, st in _SESSIONS.items()
-        }
         recent = _RECENT_SESSION
         overrides = dict(_RUNTIME_OVERRIDES)
-    return {"recent": recent, "sessions": sessions, "overrides": overrides}
+    return {"recent": recent, "sessions": sessions, "overrides": overrides,
+            "events": list(EVENT_LOG[-100:]), "last_event_seq": last_event_seq()}
 
 
 def set_session_override(session_id: Any, enabled: bool) -> None:

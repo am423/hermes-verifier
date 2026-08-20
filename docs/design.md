@@ -379,26 +379,30 @@ the primary session.
 
 ## 11. Persistence and observability
 
-Every finalized verifier turn is appended to JSONL inside the owning session's artifacts
-directory:
+Every finalized verifier turn is appended to JSONL inside the plugin's durable
+data root (`$HERMES_HOME/plugin-data/hermes-verifier/`, the sanctioned per-plugin
+storage convention — survives plugin updates and removal):
 
-- default verifier: `<session>/__verify.jsonl`
-- named verifier: `<session>/__verify.<slug>.jsonl`
+- default verifier: `verify.<session>.default.jsonl`
+- named verifier: `verify.<session>.<slug>.jsonl`
 
-The file follows session switches: on `/new`, resume/switch, and branch the recorder
-reopens at the new session's path on the next verifier turn; before a `/drop` deletes
-the old artifacts dir the recorder feed is detached and drained so a queued write cannot
-recreate the deleted file. The on-disk log is append-only and independent of the
-in-memory context — re-primes and compaction never truncate it.
+Each record carries the finding, severity, verifier slug, model, usage/cost, and
+a bounded excerpt of the reviewed delta, so the transcript is reconstructable for
+observability. Relocating these logs into the owning session's artifacts directory
+(as the original design specifies) needs a session-file lookup through the session
+store — deferred as a small spike.
 
-The verifier is never a peer. Its registry identity is excluded from every agent-facing
-surface — peer rosters, broadcast targets, subagent peer prompts, and history
-index/lookup — and cannot be messaged or revived/killed from any hub surface. It is not
-addressable as a peer regardless of what tools it has been granted.
+The on-disk log is append-only and independent of the in-memory context — re-primes
+and compaction never truncate it.
 
-## 12. Backend API surface
+The verifier is never a peer. Its registry identity is excluded from every
+agent-facing surface — peer rosters, broadcast targets, subagent peer prompts, and
+history index/lookup — and cannot be messaged or revived/killed from any hub surface.
+It is not addressable as a peer regardless of what tools it has been granted.
 
-All routes mount under `/api/plugins/hermes-verifier/`.
+## 12. Backend API surface (implemented)
+
+All routes mount under `/api/plugins/hermes-verifier/` in the gateway dashboard.
 
 | Method | Route | Purpose |
 | --- | --- | --- |

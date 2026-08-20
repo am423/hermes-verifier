@@ -1,12 +1,14 @@
 """Runtime wiring tests against a fake PluginContext.
 
 Covers: enable state, the review loop (synchronous via the override hook),
-JSONL persistence, finding delivery, immunity, and the steer gate.
+JSONL persistence, finding delivery, immunity, the steer gate, roster
+verifiers, the catch-up window, the ask channel, and model persistence.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 from typing import Any, Dict
 
@@ -25,22 +27,26 @@ class FakeUsage:
 
 class FakeResult:
     def __init__(self, parsed: Any, model: str = "fake/model",
-                 usage: FakeUsage | None = None):
+                 usage: FakeUsage | None = None, text: str = ""):
         self.parsed = parsed
         self.model = model
         self.usage = usage or FakeUsage()
+        self.text = text
 
 
 class FakeLlm:
     def __init__(self) -> None:
         self.calls: list = []
         self.next: Any = None
+        self.queue: list = []
         self.raise_error: Exception | None = None
 
     def complete_structured(self, **kwargs) -> FakeResult:
         self.calls.append(kwargs)
         if self.raise_error is not None:
             raise self.raise_error
+        if self.queue:
+            return self.queue.pop(0)
         result = self.next if self.next is not None else FakeResult(None)
         self.next = None
         return result
@@ -50,9 +56,14 @@ class FakeCtx:
     def __init__(self, config: Dict[str, Any] | None = None) -> None:
         self.config = config or {}
         self.llm = FakeLlm()
+        self.set_config_calls: list = []
 
     def get_config(self, key: str, default: Any = None) -> Any:
         return self.config.get(key, default)
+
+    def set_config(self, key: str, value: Any) -> None:
+        self.set_config_calls.append((key, value))
+        self.config[key] = value
 
 
 @pytest.fixture()
@@ -61,16 +72,19 @@ def ctx(tmp_path):
     runtime._RUNTIME_OVERRIDES.clear()
     runtime._SESSIONS.clear()
     runtime._RECENT_SESSION = None
+    runtime._ROSTER_OVERRIDE = None
+    runtime.EVENT_LOG.clear()
+    runtime._EVENT_SEQ = 0
     fake = FakeCtx({"enabled": True, "model": "deepseek/deepseek-v4",
                     "immunity_turns": 3, "max_delta_chars": 20000})
     runtime.bind_ctx(fake)
     yield fake
     runtime._DATA_DIR_OVERRIDE = None
     runtime._CTX = None
+    runtime._ROSTER_OVERRIDE = None
 
 
 def _review_sync(state, delta_text):
-    # Run the real review inline instead of on a thread.
     runtime._run_review(state, delta_text)
 
 
@@ -83,6 +97,10 @@ def _turn(ctx, session="s1", history=None, response="final answer"):
     )
 
 
+def _default(state):
+    return state.verifiers["default"]
+
+
 def test_enable_state(ctx):
     assert runtime.subsystem_enabled("any") is True
     ctx.config["enabled"] = False
@@ -93,11 +111,14 @@ def test_enable_state(ctx):
 
 def test_model_resolution(ctx):
     ctx.config["model"] = "deepseek/deepseek-v4"
-    assert runtime._resolve_model(ctx) == ("deepseek", "deepseek-v4")
+    assert runtime._resolve_model_for(ctx, runtime.Verifier(slug="d", name="d")) == ("deepseek", "deepseek-v4")
     ctx.config["model"] = "gpt-something"
-    assert runtime._resolve_model(ctx) == (None, "gpt-something")
+    assert runtime._resolve_model_for(ctx, runtime.Verifier(slug="d", name="d")) == (None, "gpt-something")
     ctx.config["model"] = ""
-    assert runtime._resolve_model(ctx) == (None, None)
+    assert runtime._resolve_model_for(ctx, runtime.Verifier(slug="d", name="d")) == (None, None)
+    # Roster entry model wins over the setting.
+    v = runtime.Verifier(slug="arch", name="Architecture", model="anthropic/claude-x")
+    assert runtime._resolve_model_for(ctx, v) == ("anthropic", "claude-x")
 
 
 def test_full_cycle_raise_and_deliver(ctx, monkeypatch):
@@ -110,21 +131,21 @@ def test_full_cycle_raise_and_deliver(ctx, monkeypatch):
 
     _turn(ctx)
 
-    # The review ran synchronously: pending finding + JSONL record.
     state = runtime._get_state("s1", create=False)
     assert state is not None
-    assert state.pending["severity"] == "caution"
-    assert state.stats["reviews"] == 1
-    assert state.stats["cautions"] == 1
+    verifier = _default(state)
+    assert verifier.pending["severity"] == "caution"
+    assert verifier.stats["reviews"] == 1
+    assert verifier.stats["cautions"] == 1
 
-    log = runtime._log_path("s1")
+    log = runtime._log_path("s1", "default")
     records = [json.loads(l) for l in log.read_text().splitlines()]
     assert len(records) == 1
     assert records[0]["accepted"] is True
     assert records[0]["severity"] == "caution"
     assert records[0]["usage"]["cost_usd"] == 0.001
+    assert "final answer" in records[0]["delta_excerpt"]
 
-    # Structured call carried the model override + schema + persona.
     call = ctx.llm.calls[-1]
     assert call["provider"] == "deepseek"
     assert call["model"] == "deepseek-v4"
@@ -133,14 +154,11 @@ def test_full_cycle_raise_and_deliver(ctx, monkeypatch):
     assert call["input"][0]["type"] == "text"
     assert "final answer" in call["input"][0]["text"]
 
-    # Delivery: next primary turn's pre_llm_call injects the finding.
     injected = runtime.handle_pre_llm_call(session_id="s1")
     assert injected is not None
-    assert '<finding verifier="default" severity="caution"' in injected["context"]
+    assert '<finding severity="caution"' in injected["context"]
     assert "Bypasses the durable queue" in injected["context"]
-    # Consumed on delivery.
     assert runtime.handle_pre_llm_call(session_id="s1") is None
-    # Interrupting delivery armed the immunity cooldown.
     assert state.immunity_left == 3
 
 
@@ -149,19 +167,17 @@ def test_duplicate_suppressed(ctx, monkeypatch):
     ctx.llm.next = FakeResult({"severity": "note", "finding": "Tidy the imports",
                                "reasoning": "unused"})
     _turn(ctx)
-    assert runtime._get_state("s1").pending is not None
-    # The primary turn picks the finding up; pending is consumed.
+    assert _default(runtime._get_state("s1")).pending is not None
     assert runtime.handle_pre_llm_call(session_id="s1") is not None
-    assert runtime._get_state("s1").pending is None
+    assert _default(runtime._get_state("s1")).pending is None
 
-    # Same finding again (a later turn): emission guard drops it silently.
     ctx.llm.next = FakeResult({"severity": "note", "finding": "Tidy the imports",
                                "reasoning": "again"})
     _turn(ctx)
-    assert runtime._get_state("s1").pending is None
-    assert runtime._get_state("s1").guard.stats["deduped"] == 1
+    assert _default(runtime._get_state("s1")).pending is None
+    assert _default(runtime._get_state("s1")).guard.stats["deduped"] == 1
 
-    log = runtime._log_path("s1")
+    log = runtime._log_path("s1", "default")
     records = [json.loads(l) for l in log.read_text().splitlines()]
     assert len(records) == 2
     assert records[1]["accepted"] is False
@@ -172,9 +188,8 @@ def test_none_severity_no_finding(ctx, monkeypatch):
     ctx.llm.next = FakeResult({"severity": "none", "finding": "",
                                "reasoning": "clean turn"})
     _turn(ctx)
-    state = runtime._get_state("s1", create=False)
-    assert state.pending is None
-    assert state.stats["findings"] == 0
+    assert _default(runtime._get_state("s1")).pending is None
+    assert _default(runtime._get_state("s1")).stats["findings"] == 0
 
 
 def test_llm_failure_records_error_no_crash(ctx, monkeypatch):
@@ -182,17 +197,17 @@ def test_llm_failure_records_error_no_crash(ctx, monkeypatch):
     ctx.llm.raise_error = RuntimeError("provider 500")
     _turn(ctx)
     state = runtime._get_state("s1", create=False)
-    assert "RuntimeError" in state.stats["last_error"]
-    assert state.pending is None
+    assert "RuntimeError" in state.last_error
+    assert _default(state).pending is None
 
 
 def test_non_json_result_ignored(ctx, monkeypatch):
     monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
-    ctx.llm.next = FakeResult(None)  # parsed is None: refused / non-JSON
+    ctx.llm.next = FakeResult(None)
     _turn(ctx)
     state = runtime._get_state("s1", create=False)
-    assert state.pending is None
-    assert state.stats["reviews"] == 1
+    assert _default(state).pending is None
+    assert _default(state).stats["reviews"] == 1
 
 
 def test_blocker_steers_pre_verify(ctx, monkeypatch):
@@ -209,15 +224,14 @@ def test_blocker_steers_pre_verify(ctx, monkeypatch):
     assert steer is not None
     assert steer["action"] == "continue"
     assert "never exercised" in steer["message"]
-    assert state.pending is None
+    assert _default(state).pending is None
     assert state.immunity_left == 3
 
-    # During immunity, a blocker no longer steers (it rides next-turn injection).
     ctx.llm.next = FakeResult({"severity": "blocker", "finding": "Second blocker",
                                "reasoning": "x"})
     _turn(ctx)
     assert runtime.handle_pre_verify(session_id="s1") is None
-    assert state.pending is not None
+    assert _default(state).pending is not None
 
 
 def test_caution_does_not_steer_pre_verify(ctx, monkeypatch):
@@ -226,7 +240,6 @@ def test_caution_does_not_steer_pre_verify(ctx, monkeypatch):
                                "reasoning": "x"})
     _turn(ctx)
     assert runtime.handle_pre_verify(session_id="s1") is None
-    # But the caution is still delivered on the next turn.
     assert runtime.handle_pre_llm_call(session_id="s1") is not None
 
 
@@ -237,12 +250,12 @@ def test_session_reset_reprimes(ctx, monkeypatch):
     _turn(ctx, history=[{"role": "user", "content": "a"}])
     state = runtime._get_state("s1", create=False)
     assert state.cursor_len == 1
-    assert state.pending is not None
+    assert _default(state).pending is not None
 
     runtime.handle_session_reset(session_id="s1")
     assert state.cursor_len is None
-    assert state.pending is None
-    assert len(state.guard) == 0
+    assert _default(state).pending is None
+    assert len(_default(state).guard) == 0
 
 
 def test_disabled_session_skips_everything(ctx, monkeypatch):
@@ -250,6 +263,179 @@ def test_disabled_session_skips_everything(ctx, monkeypatch):
     ctx.config["enabled"] = False
     runtime.clear_session_override("s1")
     _turn(ctx)
-    # Disabled: no state created, no reviews, no LLM calls.
     assert runtime._get_state("s1", create=False) is None
     assert ctx.llm.calls == []
+
+
+# ── Roster ──────────────────────────────────────────────────────────────────
+
+
+def test_roster_multi_verifier_review(ctx, monkeypatch):
+    runtime._ROSTER_OVERRIDE = [
+        {"slug": "architecture", "name": "Architecture",
+         "enabled": True, "model": "anthropic/claude-x", "tools": ["read_file"],
+         "instructions": "Watch coupling."},
+        {"slug": "fixer", "name": "Fixer", "enabled": False, "model": "",
+         "tools": [], "instructions": ""},
+    ]
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.queue = [
+        FakeResult({"severity": "note", "finding": "Default sees this",
+                    "reasoning": "x"}),
+        FakeResult({"severity": "note", "finding": "Coupling grew",
+                    "reasoning": "x"}),
+    ]
+
+    _turn(ctx)
+    state = runtime._get_state("s1", create=False)
+    assert set(state.verifiers) == {"default", "architecture"}  # fixer disabled
+    arch = state.verifiers["architecture"]
+    assert arch.stats["reviews"] == 1
+    assert _default(state).stats["reviews"] == 1
+    assert arch.pending is not None and _default(state).pending is not None
+
+    # Both pendings deliver together on the next turn.
+    injected = runtime.handle_pre_llm_call(session_id="s1")
+    assert injected is not None
+    assert 'verifier="architecture"' in injected["context"]
+    assert "Coupling grew" in injected["context"]
+    assert "Default sees this" in injected["context"]
+
+    # Per-verifier JSONL + per-verifier model override.
+    assert runtime._log_path("s1", "architecture").exists()
+    assert runtime._log_path("s1", "default").exists()
+    arch_call = [c for c in ctx.llm.calls if c.get("model") == "claude-x"]
+    assert arch_call
+    # Roster instructions land in the system prompt.
+    assert "Watch coupling." in arch_call[0]["system_prompt"]
+
+
+def test_roster_discovery_from_files(tmp_path):
+    from verifier_pkg import brief
+
+    home = tmp_path / "home"
+    proj = tmp_path / "proj"
+    home.mkdir()
+    proj.mkdir()
+    (proj / "VERIFIER.yml").write_text(
+        "instructions: |\n  Shared line.\nverifiers:\n"
+        "  - name: Architecture\n    model: anthropic/claude-x\n"
+        "  - name: Bad\n    enabled: false\n"
+    )
+    roster = brief.load_roster(start_dir=proj, user_home=home)
+    assert len(roster) == 2
+    arch = next(e for e in roster if e["slug"] == "architecture")
+    assert arch["model"] == "anthropic/claude-x"
+    assert arch["shared_instructions"] == "Shared line."
+
+
+def test_roster_specificity_override(tmp_path):
+    from verifier_pkg import brief
+
+    home = tmp_path / "home"
+    proj = tmp_path / "proj"
+    (home / ".git").mkdir(parents=True)
+    (proj / ".git").mkdir(parents=True)
+    (home / "VERIFIER.yml").write_text("verifiers:\n  - name: Architecture\n    model: user-model\n")
+    (proj / "VERIFIER.yml").write_text("verifiers:\n  - name: Architecture\n    model: project-model\n")
+    roster = brief.load_roster(start_dir=proj, user_home=home)
+    arch = next(e for e in roster if e["slug"] == "architecture")
+    assert arch["model"] == "project-model"
+
+
+def test_brief_import_expansion(tmp_path):
+    from verifier_pkg import brief
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    home = tmp_path / "none"
+    (proj / "shared.md").write_text("shared priority line")
+    (proj / "VERIFIER.md").write_text(
+        "# brief\n@shared.md\n```\n@literal.md\n```\n@missing.md\n"
+    )
+    blocks = brief.load_brief_blocks(start_dir=proj, user_home=home)
+    joined = "\n".join(blocks)
+    assert "shared priority line" in joined
+    assert "@literal.md" in joined          # fenced code stays literal
+    assert "@missing.md" in joined          # missing import stays literal
+
+
+# ── Catch-up window ─────────────────────────────────────────────────────────
+
+
+def test_backlog_wait_noop_when_off(ctx):
+    state = runtime._get_state("s1")
+    start = time.monotonic()
+    runtime._backlog_wait(state, None)
+    assert time.monotonic() - start < 0.05
+
+
+def test_backlog_wait_drains_when_caught_up(ctx):
+    state = runtime._get_state("s1")
+    state.backlog = 0
+    start = time.monotonic()
+    runtime._backlog_wait(state, 1)
+    assert time.monotonic() - start < 0.2
+
+
+def test_backlog_wait_capped(ctx, monkeypatch):
+    monkeypatch.setattr(runtime, "_BACKLOG_WAIT_CAP", 0.25)
+    state = runtime._get_state("s1")
+    state.backlog = 3  # never drains
+    start = time.monotonic()
+    runtime._backlog_wait(state, 1)
+    elapsed = time.monotonic() - start
+    assert 0.2 <= elapsed < 2.0
+
+
+def test_backlog_wait_released_when_failing(ctx):
+    state = runtime._get_state("s1")
+    state.backlog = 5
+    state.consecutive_failures = 3
+    start = time.monotonic()
+    runtime._backlog_wait(state, 1)
+    assert time.monotonic() - start < 0.2
+
+
+# ── Ask channel + model persistence ─────────────────────────────────────────
+
+
+def test_ask_verifier(ctx):
+    runtime._get_state("s1")  # create session state without a review thread
+    ctx.llm.next = FakeResult(None, model="fake/model", text="It looks fine to me.")
+    result = runtime.ask_verifier("s1", "Is this safe?")
+    assert result["ok"] is True
+    assert "looks fine" in result["answer"]
+
+    records = [json.loads(l) for l in
+               runtime._log_path("s1", "default").read_text().splitlines()]
+    asks = [r for r in records if r.get("kind") == "ask"]
+    assert len(asks) == 1
+    assert asks[0]["question"] == "Is this safe?"
+
+
+def test_ask_verifier_no_session(ctx):
+    result = runtime.ask_verifier("never-seen", "question?")
+    assert result["ok"] is False
+
+
+def test_set_model_via_ctx(ctx):
+    assert runtime.set_model("openai/gpt-4o") is True
+    assert ctx.set_config_calls == [("model", "openai/gpt-4o")]
+    assert ctx.config["model"] == "openai/gpt-4o"
+
+
+# ── Events ──────────────────────────────────────────────────────────────────
+
+
+def test_event_log(ctx, monkeypatch):
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.next = FakeResult({"severity": "note", "finding": "x is wrong",
+                               "reasoning": "y"})
+    _turn(ctx)
+    kinds = {e["kind"] for e in runtime.EVENT_LOG}
+    assert {"review_started", "review", "finding", "review_finished"} <= kinds
+    seq = runtime.last_event_seq()
+    assert seq == len(runtime.EVENT_LOG)
+    assert runtime.events_after(0) == runtime.EVENT_LOG
+    assert runtime.events_after(seq) == []

@@ -39,34 +39,57 @@ primary session through context injection. No UI yet — slash commands only.
 
 Goal: the desktop UI can talk to the runtime.
 
-- [ ] `dashboard/manifest.json` + `dashboard/plugin_api.py`
-- [ ] REST: `GET /state`, `GET /transcript`, `GET /findings`, `POST /pause`,
-      `POST /resume`, `POST /ask`, `PUT /model`
-- [ ] Websocket `/events` (findings, deltas, status changes)
-- [ ] Per-session persistence: `__verify.jsonl` in session artifacts dir
+- [x] `dashboard/manifest.json` + `dashboard/plugin_api.py` (mounts under
+      `/api/plugins/hermes-verifier/` at gateway startup)
+- [x] REST: `GET /state`, `GET /transcript`, `GET /findings`, `POST /ask`,
+      `POST /pause`, `POST /resume`, `PUT /model`
+- [x] Websocket `/events` (findings, deltas, status changes; seq-cursor replay,
+      polling fallback on the client)
+- [x] Live-module sharing: plugin_api reaches the running runtime through the
+      PluginManager namespace (`hermes_plugins.<slug>`); degrades to on-disk
+      JSONL reads when the plugin is not loaded
+- [x] Per-session persistence: `verify.<session>.<verifier>.jsonl` under the
+      sanctioned `plugin-data/hermes-verifier/` root (the session-artifacts
+      relocation from the design needs a `hermes_state` lookup spike — deferred)
 
 ## M3 — Desktop UI (Verifier Mode)
 
 Goal: the session-like screen.
 
-- [ ] `desktop/plugin.js`: route `/verifier` + sidebar nav + palette command
-- [ ] Header: **Verifier Mode** title, model selector dropdown for the verifier model,
-      enable switch, status badge
-- [ ] Body: session-style transcript (watched-session deltas + finding cards),
-      streaming indicator
-- [ ] Composer: send the verifier a question; `data-hermes-send` style interaction
-- [ ] Live updates via `ctx.socket('/events')` with React Query polling fallback
-- [ ] Theme-correct styling via `var(--ui-*)` only
+- [x] `desktop/plugin.js`: route `/verifier` + sidebar nav (shield) + palette command
+- [x] Header: **Verifier Mode** title, model selector dropdown (the composer's
+      own `ModelCatalogMenu` — searchable, provider-grouped) for the Verifier
+      model, enable switch, live status chip
+- [x] Body: session-style transcript — reviewed deltas (watched excerpt) and
+      finding cards (severity chips, verifier name, time, model), ask/Q&A rows
+- [x] Composer: send the verifier a direct question (`POST /ask`), answer
+      rendered inline
+- [x] Live updates via `ctx.socket('/events')` + 4s React Query polling fallback;
+      degrades to an explanatory banner while the backend is not loaded
+- [x] Theme-correct styling via `var(--ui-*)` + inline tokens only
+- [x] Validated: ESM syntax check, inventoried by the running desktop app
+      without loader errors; ships opt-in (`defaultEnabled: false`) — enable in
+      Settings → Plugins, backend live after a gateway restart
 
 ## M4 — Review briefs, roster, polish
 
-- [ ] `VERIFIER.md` discovery (user + project walk to git root), prompt ordering,
-      `@path` import expansion
-- [ ] `VERIFIER.yml` roster: named verifiers with per-entry model/tools/instructions
-- [ ] Catch-up window (`off | 1 | 3 | 5`) for primary-turn pacing
-- [ ] Interruption cooldown (`immunity_turns`)
-- [ ] Usage/cost attribution surfaced in `/verify status`
-- [ ] Install link (`hermes://plugin/install?repo=…`) in README
+- [x] `VERIFIER.md` discovery (user + project walk to git root), prompt ordering,
+      `@path` import expansion (fences stay literal, cycles skipped, missing
+      imports stay literal)
+- [x] `VERIFIER.yml` roster: named verifiers with per-entry model / tools /
+      instructions; specificity rule (project leaf > ancestor > user); each runs
+      with its own guard, stats, model, and JSONL; findings deliver together
+- [ ] Verifier-side tool execution (roster `tools` grants are parsed, validated,
+      and surfaced; the plugin LLM surface has no tool loop — needs an
+      agent-loop design)
+- [x] Catch-up window (`off | 1 | 3 | 5`) with a 30s cap and failure-release
+- [x] Interruption cooldown (`immunity_turns`)
+- [x] Usage/cost attribution surfaced in `/verify status` (aggregated per session)
+- [x] Bundled skill (`skills/hermes-verifier/SKILL.md`) teaching Hermes how to
+      talk about Verifier Mode
+- [x] Install link documented in README (deep link; repo layout caveat noted)
+- [ ] Real-session smoke test — requires a gateway restart (would kill the
+      active session; next natural restart)
 
 ## Risks / spikes
 
