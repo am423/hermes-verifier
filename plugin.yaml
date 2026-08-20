@@ -22,10 +22,14 @@ config_schema:
     type: bool
     default: false
     description: "Run the verifier after every primary turn. Default off; toggle per session with /verify on."
-  model:
+  verifier_model:
     type: str
     default: ""
-    description: "Verifier model as 'provider/model' or a plain model id. Empty = the session's primary model."
+    description: "Verifier model as 'provider/model' or a plain model id. Empty = the session's primary model. ('model' is a reserved settings root, hence the prefix.)"
+  verifier_session:
+    type: str
+    default: ""
+    description: "Designated Verifier Mode session (managed by the desktop UI; do not edit by hand)."
   sync_backlog:
     type: str
     default: "off"

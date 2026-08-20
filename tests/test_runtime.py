@@ -73,9 +73,10 @@ def ctx(tmp_path):
     runtime._SESSIONS.clear()
     runtime._RECENT_SESSION = None
     runtime._ROSTER_OVERRIDE = None
+    runtime._VERIFIER_SESSION = None
     runtime.EVENT_LOG.clear()
     runtime._EVENT_SEQ = 0
-    fake = FakeCtx({"enabled": True, "model": "deepseek/deepseek-v4",
+    fake = FakeCtx({"enabled": True, "verifier_model": "deepseek/deepseek-v4",
                     "immunity_turns": 3, "max_delta_chars": 20000})
     runtime.bind_ctx(fake)
     yield fake
@@ -110,11 +111,11 @@ def test_enable_state(ctx):
 
 
 def test_model_resolution(ctx):
-    ctx.config["model"] = "deepseek/deepseek-v4"
+    ctx.config["verifier_model"] = "deepseek/deepseek-v4"
     assert runtime._resolve_model_for(ctx, runtime.Verifier(slug="d", name="d")) == ("deepseek", "deepseek-v4")
-    ctx.config["model"] = "gpt-something"
+    ctx.config["verifier_model"] = "gpt-something"
     assert runtime._resolve_model_for(ctx, runtime.Verifier(slug="d", name="d")) == (None, "gpt-something")
-    ctx.config["model"] = ""
+    ctx.config["verifier_model"] = ""
     assert runtime._resolve_model_for(ctx, runtime.Verifier(slug="d", name="d")) == (None, None)
     # Roster entry model wins over the setting.
     v = runtime.Verifier(slug="arch", name="Architecture", model="anthropic/claude-x")
@@ -421,8 +422,22 @@ def test_ask_verifier_no_session(ctx):
 
 def test_set_model_via_ctx(ctx):
     assert runtime.set_model("openai/gpt-4o") is True
-    assert ctx.set_config_calls == [("model", "openai/gpt-4o")]
-    assert ctx.config["model"] == "openai/gpt-4o"
+    assert ctx.set_config_calls == [("verifier_model", "openai/gpt-4o")]
+    assert ctx.config["verifier_model"] == "openai/gpt-4o"
+
+
+def test_mark_verifier_session(ctx):
+    runtime.mark_verifier_session("vs1")
+    assert runtime.designated_session() == "vs1"
+    assert runtime.subsystem_enabled("vs1") is True
+    assert ctx.set_config_calls == [("verifier_session", "vs1")]
+
+
+def test_designated_session_persisted(ctx):
+    ctx.config["verifier_session"] = "stored-session"
+    assert runtime.designated_session() == "stored-session"
+    # The persisted designation also arms the session override.
+    assert runtime.subsystem_enabled("stored-session") is True
 
 
 # ── Events ──────────────────────────────────────────────────────────────────

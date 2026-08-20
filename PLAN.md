@@ -54,22 +54,23 @@ Goal: the desktop UI can talk to the runtime.
 
 ## M3 — Desktop UI (Verifier Mode)
 
-Goal: the session-like screen.
+Goal: a real session screen with the verifier attached.
 
 - [x] `desktop/plugin.js`: route `/verifier` + sidebar nav (shield) + palette command
-- [x] Header: **Verifier Mode** title, model selector dropdown (the composer's
-      own `ModelCatalogMenu` — searchable, provider-grouped) for the Verifier
-      model, enable switch, live status chip
-- [x] Body: session-style transcript — reviewed deltas (watched excerpt) and
-      finding cards (severity chips, verifier name, time, model), ask/Q&A rows
-- [x] Composer: send the verifier a direct question (`POST /ask`), answer
-      rendered inline
-- [x] Live updates via `ctx.socket('/events')` + 4s React Query polling fallback;
-      degrades to an explanatory banner while the backend is not loaded
+- [x] The sidebar entry opens the designated verifier session — a REAL session
+      (created via `session.create`, opened through `host.openSession`) in the
+      native chat surface, with the verifier attached via a session override
+- [x] Titlebar overlay while that session is focused: **Verifier Mode** title,
+      model selector dropdown (the composer's own `ModelCatalogMenu`), live
+      status chip (active / verifying / paused / error)
+- [x] Findings pane (right side): live verifier activity transcript
+- [x] Live updates via `ctx.socket('/events')` + React Query polling fallback
 - [x] Theme-correct styling via `var(--ui-*)` + inline tokens only
-- [x] Validated: ESM syntax check, inventoried by the running desktop app
-      without loader errors; ships opt-in (`defaultEnabled: false`) — enable in
-      Settings → Plugins, backend live after a gateway restart
+- [x] Ships opt-in (`defaultEnabled: false`) — enable in Settings → Plugins,
+      then the sidebar entry appears
+- [x] Fixed: `settings.model` was a reserved settings root (rejected on read and
+      write) — renamed to `settings.verifier_model`; designated session persists
+      under `settings.verifier_session`
 
 ## M4 — Review briefs, roster, polish
 

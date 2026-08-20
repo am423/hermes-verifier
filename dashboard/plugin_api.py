@@ -153,7 +153,7 @@ def _state_payload() -> Dict[str, Any]:
     settings = _plugin_settings()
     payload["settings"] = {
         "enabled": bool(settings.get("enabled", False)),
-        "model": str(settings.get("model") or ""),
+        "model": str(settings.get("verifier_model") or ""),
         "sync_backlog": str(settings.get("sync_backlog") or "off"),
         "immunity_turns": int(settings.get("immunity_turns", 3)),
         "max_delta_chars": int(settings.get("max_delta_chars", 20000)),
@@ -163,6 +163,11 @@ def _state_payload() -> Dict[str, Any]:
     payload["transcript"] = _transcript_from_disk(None, 60)
     payload["last_event_seq"] = (
         runtime.last_event_seq() if runtime is not None else 0
+    )
+    payload["verifier_session"] = (
+        runtime.designated_session()
+        if runtime is not None
+        else str(settings.get("verifier_session") or "") or None
     )
     return payload
 
@@ -192,6 +197,32 @@ async def findings(session: str = "", limit: int = 60) -> Dict[str, Any]:
     records = _transcript_from_disk(session or None, limit * 4)
     accepted = [r for r in records if r.get("accepted", True) and r.get("kind") != "ask"]
     return {"ok": True, "findings": accepted[:limit]}
+
+
+@router.get("/verifier-session")
+async def verifier_session() -> Dict[str, Any]:
+    """The designated Verifier Mode session, or null before the first open."""
+    runtime = _runtime()
+    if runtime is not None:
+        session_id = runtime.designated_session()
+        if session_id:
+            return {"ok": True, "session_id": session_id}
+        return {"ok": True, "session_id": None}
+    settings = _plugin_settings()
+    return {"ok": True, "session_id": str(settings.get("verifier_session") or "") or None}
+
+
+@router.post("/verifier-session")
+async def mark_verifier_session(body: dict) -> JSONResponse:
+    """Designate the session the Verifier Mode screen drives."""
+    session_id = str(body.get("session_id") or "").strip()
+    if not session_id:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "session_id required"})
+    runtime = _runtime()
+    if runtime is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "verifier backend not loaded"})
+    runtime.mark_verifier_session(session_id)
+    return JSONResponse(content={"ok": True, "session_id": session_id})
 
 
 @router.post("/ask")

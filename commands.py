@@ -47,7 +47,7 @@ def _status_lines() -> List[str]:
     cfg = runtime._CTX
     lines: List[str] = []
     default_enabled = bool(runtime._config(cfg, "enabled", False))
-    model_cfg = str(runtime._config(cfg, "model", "") or "").strip() or "(primary model)"
+    model_cfg = str(runtime._config(cfg, "verifier_model", "") or "").strip() or "(primary model)"
     lines.append(f"[hermes-verifier] config default: {'on' if default_enabled else 'off'} | model: {model_cfg}")
 
     sessions = snap["sessions"]

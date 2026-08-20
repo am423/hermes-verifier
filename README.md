@@ -24,9 +24,11 @@ the primary agent runs off a cliff.
   and specialization.
 - **Clean delivery** — an emission guard normalizes, dedupes, and rate-limits findings
   so the verifier never nags.
-- **First-class UI** — a Verifier Mode screen that looks and feels like a normal
-  session: transcript view, composer, and the composer's own model catalog as the
-  verifier model selector.
+- **First-class UI** — a **Verifier Mode** that rides on a real session: the
+  sidebar's Verifier entry opens a regular session screen with the verifier
+  attached, the titlebar shows "Verifier Mode" plus the verifier model
+  selector (the composer's own model catalog) while that session is focused,
+  and a Findings pane shows the verifier's live activity.
 
 ## Repository layout (the repo root IS the installable package)
 

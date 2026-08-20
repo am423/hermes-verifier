@@ -306,8 +306,12 @@ def _split_model(raw: str) -> tuple:
 
 
 def _resolve_model_for(ctx: Any, verifier: Verifier) -> tuple:
-    """Per-verifier model: roster entry wins, else the plugin setting."""
-    selector = verifier.model or str(_config(ctx, "model", "") or "")
+    """Per-verifier model: roster entry wins, else the plugin setting.
+
+    The setting key is ``verifier_model`` — a bare ``model`` key is a reserved
+    root in the plugin settings namespace and is rejected on read and write.
+    """
+    selector = verifier.model or str(_config(ctx, "verifier_model", "") or "")
     return _split_model(selector)
 
 
@@ -670,26 +674,72 @@ def handle_session_reset(session_id: Any = "", **kwargs: Any) -> None:
 # ---------------------------------------------------------------------------
 
 def set_model(value: str) -> bool:
-    """Persist the default verifier model through the plugin settings namespace."""
+    """Persist the default verifier model through the plugin settings namespace.
+
+    Writes ``settings.verifier_model`` (``model`` is a reserved settings root).
+    """
     cleaned = (value or "").strip()
     if _CTX is not None:
         try:
-            _CTX.set_config("model", cleaned)
+            _CTX.set_config("verifier_model", cleaned)
             return True
         except Exception as exc:
-            logger.warning("ctx.set_config('model') failed: %s", exc)
+            logger.warning("ctx.set_config('verifier_model') failed: %s", exc)
     try:  # fallback: write config directly (gateway dashboard context)
         from hermes_cli import config as config_mod
 
         partial = {
-            "plugins": {"entries": {PLUGIN_ID: {"settings": {"model": cleaned}}}}
+            "plugins": {"entries": {PLUGIN_ID: {"settings": {"verifier_model": cleaned}}}}
         }
-        full_path = ("plugins", "entries", PLUGIN_ID, "settings", "model")
+        full_path = ("plugins", "entries", PLUGIN_ID, "settings", "verifier_model")
         config_mod.save_config(partial, preserve_keys={full_path}, merge_existing=True)
         return True
     except Exception as exc:
-        logger.warning("direct config write for model failed: %s", exc)
+        logger.warning("direct config write for verifier_model failed: %s", exc)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Designated verifier session (the Verifier Mode screen's real session)
+# ---------------------------------------------------------------------------
+
+_VERIFIER_SESSION: Optional[str] = None
+
+
+def mark_verifier_session(session_id: Any) -> str:
+    """Designate ``session_id`` as the verifier session and attach the
+    verifier to it. Persists the designation in plugin settings so the
+    desktop UI can re-open the same session after a restart.
+    """
+    global _VERIFIER_SESSION, _RECENT_SESSION
+    key = _session_key(session_id)
+    with _LOCK:
+        _VERIFIER_SESSION = key
+        _RECENT_SESSION = key
+        _RUNTIME_OVERRIDES[key] = True
+    if _CTX is not None:
+        try:
+            _CTX.set_config("verifier_session", key)
+        except Exception as exc:
+            logger.warning("ctx.set_config('verifier_session') failed: %s", exc)
+    publish_event("status", {"session_id": key, "enabled": True, "designated": True})
+    return key
+
+
+def designated_session() -> Optional[str]:
+    global _VERIFIER_SESSION
+    with _LOCK:
+        key = _VERIFIER_SESSION
+    if key:
+        return key
+    # Fall back to the persisted designation (fresh process, no marks yet).
+    persisted = _config(_CTX, "verifier_session", "") if _CTX is not None else ""
+    if persisted:
+        with _LOCK:
+            _VERIFIER_SESSION = str(persisted)
+            _RUNTIME_OVERRIDES.setdefault(str(persisted), True)
+        return str(persisted)
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -340,42 +340,41 @@ restarts. Catch-up waiters are released as soon as a verifier is failing.
 
 ## 10. Desktop UI — Verifier Mode
 
-The plugin registers a full page at `/verifier` (sidebar nav + ⌘K palette command) whose
-layout matches a normal session screen:
+Verifier Mode rides on a **real session**. The sidebar's Verifier entry
+(visible once the plugin is enabled in Settings → Plugins) routes to
+`/verifier`, which resolves the designated verifier session — creating one
+via `session.create` on first use — and hands it to the native chat surface
+through `host.openSession`. The user runs the session normally; the verifier
+is attached to it through a session-scoped override, so every turn is
+reviewed and findings are delivered into the transcript.
+
+While the designated session holds focus, the titlebar shows the Verifier
+Mode chrome:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│  Verifier Mode                          [model ▾] [on/off] │
-│  ─────────────────────────────────────────────────────────  │
-│                                                            │
-│   (session-style transcript: watched-session deltas        │
-│    interleaved with finding cards)                         │
-│                                                            │
-│  ─────────────────────────────────────────────────────────  │
-│  [ composer — ask the verifier a question ]          [send] │
-└────────────────────────────────────────────────────────────┘
+[Verifier Mode]  model [anthropic/claude-sonnet-4-5 ▾]  ● verifying
 ```
 
-**Header.** Top of the page says **Verifier Mode**. Directly beneath/inside the header
-row: a model selector dropdown labeled with the selected **Verifier** model (populated
-from the profile's configured models), an enable switch, and a live status badge
-(idle / reviewing / paused / no_model / error).
+- **Verifier Mode** — fixed label; present only while the verifier session is
+  focused.
+- **Model selector** — the composer's own model catalog menu; the selection is
+  written through `PUT /model` (persisted as `settings.verifier_model`).
+- **Status chip** — `active` / `verifying` / `paused` / `error`, from the live
+  runtime snapshot.
 
-**Body.** The transcript area renders like a session: assistant-style turns from the
-watched session (primary deltas) with finding cards visually distinct (severity color,
-verifier name, timestamp). Streams live while the verifier reviews.
-
-**Composer.** Bottom composer sends the verifier a direct question without disturbing
-the primary session.
+A right-side **Findings** pane shows the verifier's activity transcript
+(findings with severity chips, suppressed items, direct questions and
+answers), streaming over the `/events` socket with a polling fallback.
 
 **Wiring.**
 
-- Backend state via `ctx.rest` (`GET /state`, `GET /transcript`, `POST /ask`, `PUT /model`)
+- Backend state via `ctx.rest` (`GET /state`, `GET/POST /verifier-session`,
+  `PUT /model`, `POST /ask`)
 - Live updates via `ctx.socket('/events')`; polling fallback with React Query
-- Model selector writes through `PUT /model`, which the backend applies via the
-  `llm.model_override` capability; the choice persists in plugin settings
-- Styling strictly with `var(--ui-*)` theme variables; UI kit components (`Select`,
-  `Switch`, `Badge`, `Button`, `Textarea`) so the screen matches the app pixel-for-pixel
+- Model selector writes through `PUT /model`, applied via
+  `settings.verifier_model` (`model` alone is a reserved settings root)
+- Styling strictly with `var(--ui-*)` theme variables; UI kit components so
+  the screen matches the app pixel-for-pixel
 
 ## 11. Persistence and observability
 
