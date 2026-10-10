@@ -1,14 +1,21 @@
 """Prove d1-omni answers a multi-question set, with confidence, at zero output cost.
 
-API shape verified against the model source before writing this
-(huggingface.co/LiquidAI/d1-omni-600M):
+API shape verified against the model's own source before writing this. All
+citations below refer to the file in the Hugging Face repository --
+huggingface.co/LiquidAI/d1-omni-600M/raw/main/prompt.py (131 lines) and
+.../modeling_d1.py -- not to any file in this plugin:
 
-  * modeling_d1.py:66  system_one(state, questions: Mapping, images=None, audio=None)
-  * modeling_d1.py:78  -> {"answers": {...}, "usage": {"input_tokens": n, "output_tokens": 0}}
-  * modeling_d1.py:81  probabilities(state, questions: Sequence, ...)   <- SEQUENCE, not Mapping
-  * prompt.py:19       QTYPES = {"choice": 0, "score": 1, "noul": 2}
-  * prompt.py:117      noul  -> {"noul": probs[0]}
-  * prompt.py:124      score -> {"score": sum(i * p), "confidence": ...}  (expected value, a FLOAT)
+  * modeling_d1.py system_one(state, questions: Mapping, images=None, audio=None)
+  * modeling_d1.py        -> {"answers": {...}, "usage": {"input_tokens": n, "output_tokens": 0}}
+  * modeling_d1.py probabilities(state, questions: Sequence, ...)   <- SEQUENCE, not Mapping
+  * prompt.py QTYPES = {"choice": 0, "score": 1, "noul": 2}
+  * prompt.py answer(): noul -> {"noul": probs[0]}, and its docstring says a
+    noul's probabilities are [yes, no]. NOTE: render_options() in the same file
+    comments that "a noul is read as [false, true]", contradicting that. Settled
+    empirically in sidecar/polarity.py: a clearly-true statement scores 0.948 and
+    the inverted one 0.028, so noul tracks P(true) and the answer() docstring is
+    the correct one.
+  * prompt.py score -> {"score": sum(i * p), ...}  (expected value, a FLOAT)
 
 The two shapes differ on purpose: `system_one` wants named questions, while
 `probabilities` takes a positional sequence. Passing a dict to the latter
@@ -56,7 +63,8 @@ def check_probabilities(probs, n_questions: int, noul_answer=None):
         total = sum(dist)
         if abs(total - 1.0) > 1e-3:
             reasons.append(f"distribution {i} sums to {total:.4f}, not 1")
-    # The two APIs must agree: noul IS probs[0][0] (prompt.py:117).
+    # The two APIs must agree: noul IS probs[0][0] (see answer() in the HF repo's
+    # prompt.py; polarity settled empirically in sidecar/polarity.py).
     if not reasons and noul_answer is not None:
         if abs(float(noul_answer) - float(probs[0][0])) > 1e-9:
             reasons.append(f"noul answer {noul_answer} != probs[0][0] {probs[0][0]}")
