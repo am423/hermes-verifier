@@ -42,7 +42,12 @@ def test_ask_survives_a_completion_with_no_text(ctx):  # noqa: F811
     except TypeError as exc:  # pragma: no cover - that is the bug
         raise AssertionError(f"ask_verifier crashed on an empty completion: {exc}")
     assert isinstance(out, dict)
-    assert out.get("ok") is True
+    # NOT ok: an empty completion is a failure. This assertion previously read
+    # `ok is True`, which pinned the bug -- /ask answered an empty string with
+    # ok:true, making "the model said nothing" indistinguishable from a real
+    # answer. Same failure class the review path was hardened against.
+    assert out.get("ok") is False, out
+    assert out.get("error"), "a failure must say why"
 
 
 # ── resource release ────────────────────────────────────────────────────────

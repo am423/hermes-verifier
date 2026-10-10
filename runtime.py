@@ -49,6 +49,21 @@ NUDGE_TEXT = (
     "design decisions and failure modes you have not yet ruled out."
 )
 
+# /ask asks a QUESTION, so it must not reuse REVIEW_SCHEMA: that schema demands a
+# severity/finding/reasoning envelope, so the model answered a question with a
+# review verdict and the UI rendered the raw envelope as the answer.
+ASK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {
+            "type": "string",
+            "description": "A direct answer to the question. Concrete and specific.",
+        },
+    },
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
@@ -480,18 +495,20 @@ def _resolve_model_for(ctx: Any, verifier: Verifier) -> tuple:
 
 def _call_structured(ctx: Any, *, system_prompt: str, instructions: str,
                      input_text: str, provider: Optional[str],
-                     model: Optional[str],
-                     max_tokens: Optional[int] = None) -> Any:
+                     model: Optional[str], max_tokens: Optional[int] = None,
+                     json_schema: Optional[Dict[str, Any]] = None,
+                     schema_name: str = "verifier_review",
+                     purpose: str = "hermes-verifier review") -> Any:
     from agent.plugin_llm import PluginLlmTrustError  # noqa: F401
 
     kwargs: Dict[str, Any] = dict(
         instructions=instructions,
         input=[{"type": "text", "text": input_text}],
-        json_schema=REVIEW_SCHEMA,
+        json_schema=json_schema or REVIEW_SCHEMA,
         json_mode=True,
-        schema_name="verifier_review",
+        schema_name=schema_name,
         system_prompt=system_prompt,
-        purpose="hermes-verifier review",
+        purpose=purpose,
         timeout=120.0,
     )
     if max_tokens:
@@ -1125,6 +1142,8 @@ def ask_verifier(session_id: Any, question: str) -> Dict[str, Any]:
                 instructions=f"Answer this question about the session:\n\n{question}",
                 input_text="(direct question; no transcript delta provided)",
                 provider=provider, model=model,
+                json_schema=ASK_SCHEMA, schema_name="verifier_answer",
+                purpose="hermes-verifier ask",
             )
         except Exception as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
@@ -1144,9 +1163,22 @@ def ask_verifier(session_id: Any, question: str) -> Dict[str, Any]:
             } if usage is not None else {},
         }
         _append_jsonl(_log_path(state.session_id, verifier.slug), record)
+        # An empty or unparseable completion must NOT read as a successful empty
+        # answer. Same failure class the review path was hardened against: "the
+        # model said nothing" and "the model had nothing to say" are different,
+        # and only one of them is success.
+        parsed = getattr(result, "parsed", None)
+        answer = ""
+        if isinstance(parsed, dict):
+            answer = str(parsed.get("answer") or "").strip()
+        if not answer:
+            answer = (getattr(result, "text", "") or "").strip()
+        if not answer:
+            return {"ok": False,
+                    "error": "the verifier returned an empty answer"}
         return {
             "ok": True,
-            "answer": getattr(result, "text", ""),
+            "answer": answer[:4000],
             "model": getattr(result, "model", "") or "",
         }
     finally:

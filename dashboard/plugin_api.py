@@ -283,7 +283,11 @@ async def ask(body: dict) -> JSONResponse:
     session_id = body.get("session_id") or runtime.recent_session()
     if not session_id:
         return JSONResponse(status_code=404, content={"ok": False, "error": "no active verifier session"})
-    result = runtime.ask_verifier(session_id, question)
+    # ask_verifier makes a BLOCKING model call (up to a 120s timeout) and this is
+    # a coroutine, so awaiting it inline stalled the whole event loop: every
+    # other dashboard request AND the events websocket froze for the duration of
+    # the answer. Hand it to a worker thread instead.
+    result = await asyncio.to_thread(runtime.ask_verifier, session_id, question)
     return JSONResponse(status_code=200 if result.get("ok") else 409, content=result)
 
 
