@@ -79,7 +79,11 @@ GATE_MAX_TOKENS = 900
 class GateDecision(NamedTuple):
     engage: bool
     effort: str
-    source: str          # "model" | "fail-safe"
+    source: str          # "model" | "fail-safe" | "disabled"
+    # Provider usage for the decision call, when one was actually made. The gate
+    # is the cheap half of the design, but it is not free, and cost accounting
+    # that ignores it under-reports every turn the gate looked at.
+    usage: Any = None
 
     @property
     def tier(self) -> str:
@@ -131,6 +135,7 @@ def decide(ctx: Any, *, digest: str, provider: Optional[str],
         # Unreachable, denied, timed out, or a trust error: review anyway.
         return FAIL_SAFE
 
+    usage = getattr(result, "usage", None)
     parsed = getattr(result, "parsed", None)
     if not isinstance(parsed, dict):
         # Covers the empty-completion case: parsed is None and text is "".
@@ -146,7 +151,7 @@ def decide(ctx: Any, *, digest: str, provider: Optional[str],
     # turn is meaningless, so normalise it rather than propagate it.
     return GateDecision(engage=engage,
                         effort=effort if engage else "routine",
-                        source="model")
+                        source="model", usage=usage)
 
 
 def describe(decision: GateDecision) -> str:

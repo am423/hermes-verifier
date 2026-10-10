@@ -98,3 +98,86 @@ def test_eviction_prefers_sessions_with_nothing_in_flight(ctx):  # noqa: F811
     assert "busy" in runtime._SESSIONS, (
         "a session with an undelivered finding was evicted while idle ones lived"
     )
+
+
+# ── the gate's cost, and silent skips ───────────────────────────────────────
+
+def test_the_gate_call_is_billed_to_the_session(ctx, monkeypatch):  # noqa: F811
+    """The gate is the cheap half of the design but it is not free. Cost
+    accounting that ignored it under-reports every turn it examined."""
+    from verifier_pkg import gate
+    ctx.config["gate_enabled"] = True
+
+    class _Usage:
+        input_tokens, output_tokens = 180, 40
+
+    monkeypatch.setattr(runtime, "_GATE_FN_OVERRIDE",
+                        lambda state, delta: gate.GateDecision(
+                            True, "deep", "model", usage=_Usage()))
+    state = runtime._get_state("s1")
+    ctx.llm.queue = [FakeResult({"severity": "none", "finding": "", "reasoning": ""})]
+    runtime._run_review(state, "some delta", 1)
+
+    snap = runtime.snapshot()["sessions"][state.session_id]
+    assert snap["gate_input_tokens"] == 180, "the decision's input tokens went unbilled"
+    assert snap["gate_output_tokens"] == 40
+
+
+def test_a_delta_that_could_not_be_reviewed_is_visible(ctx, full_inflight=None):  # noqa: F811
+    """When every slot is busy the delta is skipped forever -- the cursor already
+    advanced. That was a debug line only: no event, no counter, nothing in
+    status, so a busy reviewer was indistinguishable from a quiet one."""
+    state = runtime._get_state("s1")
+    held = 0
+    while runtime._INFLIGHT.acquire(blocking=False):
+        held += 1
+    try:
+        runtime._run_review(state, "a delta nobody will review", 7)
+    finally:
+        for _ in range(held):
+            runtime._INFLIGHT.release()
+
+    assert state.reviews_dropped == 1
+    events = [e for e in runtime.EVENT_LOG if e.get("kind") == "review_skipped"]
+    assert events, "the skip left no trace at all"
+    assert events[-1]["origin_turn"] == 7
+    assert runtime.snapshot()["sessions"][state.session_id]["reviews_dropped"] == 1
+
+
+# ── concurrent cycles must not interleave on one verifier's guard ───────────
+
+def test_reviews_for_one_verifier_do_not_overlap(ctx):  # noqa: F811
+    """Two cycles can be in flight at once and they share the verifier's
+    EmissionGuard, which holds per-CYCLE state: begin_cycle resets the budget,
+    so the first finisher consumed it and the second review's distinct finding
+    was dropped as rate_limited."""
+    import threading
+    import time
+
+    state = runtime._get_state("s1")
+    verifier = state.verifiers["default"]
+
+    inside = []
+    overlaps = []
+
+    def slow(**kwargs):
+        inside.append(1)
+        if len(inside) > 1:
+            overlaps.append(1)
+        time.sleep(0.06)
+        inside.pop()
+        return FakeResult({"severity": "none", "finding": "", "reasoning": ""})
+
+    ctx.llm.complete_structured = slow
+    threads = [threading.Thread(target=runtime._review_one,
+                                args=(state, verifier, f"delta {i}", "deep", i),
+                                daemon=True) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert not overlaps, (
+        "two review cycles ran concurrently on one verifier, interleaving on its "
+        "per-cycle guard state"
+    )

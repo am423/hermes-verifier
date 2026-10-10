@@ -80,9 +80,14 @@ def _status_lines() -> List[str]:
                 est = max(est, runtime.safe_int(st.get("est_tokens", 0)))
                 actual = max(actual, runtime.safe_int(st.get("last_input_tokens", 0)))
         tok_seg = f" | last review: ~{est} est / {actual} actual tokens" if actual else ""
+        # A delta that could not be reviewed is gone forever (its cursor already
+        # advanced), so it has to be visible here rather than only in a log line.
+        dropped = sum(int(s.get("reviews_dropped", 0) or 0)
+                      for s in snap["sessions"].values())
+        drop_seg = f", {dropped} turn(s) NOT reviewed" if dropped else ""
         lines.append(
             f"  engagement: {total_reviews} review(s), {total_empty} empty response(s)"
-            f"{tok_seg}"
+            f"{drop_seg}{tok_seg}"
         )
         # The gate's own line: how often it was consulted, how often it saved a
         # review, and what it decided last. A gate that never skips anything is
@@ -101,8 +106,13 @@ def _status_lines() -> List[str]:
                     bool(last.get("engage")), str(last.get("effort") or "deep"),
                     str(last.get("source") or "model"))
                 verdict = " | " + gate_mod.describe(decision)
+            gate_in = sum(int(s.get("gate_input_tokens", 0) or 0)
+                          for s in snap["sessions"].values())
+            gate_out = sum(int(s.get("gate_output_tokens", 0) or 0)
+                           for s in snap["sessions"].values())
+            tok = f" | {gate_in} in / {gate_out} out" if gate_in else ""
             lines.append(
-                f"  gate: consulted {checked}x, skipped {skipped} ({pct}){verdict}"
+                f"  gate: consulted {checked}x, skipped {skipped} ({pct}){tok}{verdict}"
             )
 
     sessions = snap["sessions"]

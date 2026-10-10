@@ -25,6 +25,7 @@ import json
 import logging
 import re
 import threading
+import types
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -155,6 +156,13 @@ class Verifier:
     instructions: str = ""
     shared_instructions: str = ""
     guard: guard_mod.EmissionGuard = field(default_factory=guard_mod.EmissionGuard)
+    # Serialises review cycles for THIS verifier. Two cycles can be in flight
+    # (_MAX_INFLIGHT is 2) and they share one guard, which is per-CYCLE state:
+    # begin_cycle resets the rate-limit budget and the dedupe window, so the
+    # first finisher consumed the budget and the second review's distinct finding
+    # was dropped as rate_limited.
+    review_lock: Any = field(default_factory=threading.Lock, repr=False,
+                             compare=False)
     # Undelivered findings, oldest first. A QUEUE, not a slot: concurrent
     # review cycles can each accept a finding before the next primary turn.
     pending: List[Dict[str, Any]] = field(default_factory=list)
@@ -188,6 +196,9 @@ class SessionVerifier:
     last_gate: Any = None
     gate_checked: int = 0
     gate_skipped: int = 0
+    gate_input_tokens: int = 0
+    gate_output_tokens: int = 0
+    reviews_dropped: int = 0
 
     def ensure_verifiers(self, roster: List[Dict[str, Any]]) -> None:
         """Rebuild the verifier list when the roster changes."""
@@ -561,6 +572,19 @@ def _plugin_llm_trust_error_type() -> Any:
 
 def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
                 effort: str = "deep", origin_turn: int = 0) -> None:
+    """Serialise per verifier, then run one review cycle.
+
+    Overlapping cycles for the same verifier share its EmissionGuard, which
+    holds per-CYCLE state. Without this lock they interleave on it and a
+    distinct finding is dropped as rate_limited.
+    """
+    with verifier.review_lock:
+        return _review_one_serial(state, verifier, delta_text,
+                                  effort=effort, origin_turn=origin_turn)
+
+
+def _review_one_serial(state: SessionVerifier, verifier: Verifier, delta_text: str,
+                       effort: str = "deep", origin_turn: int = 0) -> None:
     ctx = _CTX
     if ctx is None:
         return
@@ -613,11 +637,24 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
         # where the review costs more than it is worth.
         evidence: List[str] = []
         evidence_chars = 0
+        # Every completion this review makes is billed: the initial call, each
+        # tool-request response, and the empty-response retry. Recording only the
+        # LAST one under-reported cost whenever the tool path was used, which is
+        # exactly when a review is most expensive.
+        billed_in = billed_out = 0
+        billed_cost = 0.0
+        last_usage: Any = None
         for _attempt in range(attempts):
             result = _call_structured(
                 ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
                 input_text=transcript, provider=provider, model=model, **cap_kwargs,
             )
+            _u = getattr(result, "usage", None)
+            if _u is not None:
+                billed_in += int(getattr(_u, "input_tokens", 0) or 0)
+                billed_out += int(getattr(_u, "output_tokens", 0) or 0)
+                billed_cost += float(getattr(_u, "cost_usd", None) or 0.0)
+                last_usage = _u
             # An empty completion surfaces as content_type="text" with no payload:
             # _parse_structured_text returns (None, "text") on an empty body.
             # Retry once, inside this try so the failure bookkeeping still applies.
@@ -634,6 +671,12 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
                     ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
                     input_text=transcript, provider=provider, model=model, **cap_kwargs,
                 )
+                _ru = getattr(result, "usage", None)
+                if _ru is not None:
+                    billed_in += int(getattr(_ru, "input_tokens", 0) or 0)
+                    billed_out += int(getattr(_ru, "output_tokens", 0) or 0)
+                    billed_cost += float(getattr(_ru, "cost_usd", None) or 0.0)
+                    last_usage = _ru
             call = tools_mod.parse_tool_call(getattr(result, "text", "") or "", grant)
             if call is None:
                 break
@@ -685,13 +728,15 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
 
     state.consecutive_failures = 0
     state.last_error = ""
-    usage = getattr(result, "usage", None)
+    # The review's TOTAL, across every completion it made.
+    usage = (types.SimpleNamespace(input_tokens=billed_in, output_tokens=billed_out,
+                                   cost_usd=billed_cost or None)
+             if last_usage is not None else None)
     if usage is not None:
-        verifier.stats["input_tokens"] += int(getattr(usage, "input_tokens", 0) or 0)
-        verifier.stats["output_tokens"] += int(getattr(usage, "output_tokens", 0) or 0)
-        cost = getattr(usage, "cost_usd", None)
-        if cost:
-            verifier.stats["cost_usd"] += float(cost)
+        verifier.stats["input_tokens"] += billed_in
+        verifier.stats["output_tokens"] += billed_out
+        if billed_cost:
+            verifier.stats["cost_usd"] += billed_cost
     verifier.stats["model"] = getattr(result, "model", "") or ""
     verifier.stats["reviews"] += 1
 
@@ -752,7 +797,11 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
     }
     # Latest values for /verify status. Updated every review (not setdefault).
     verifier.stats["est_tokens"] = parts["est_tokens"]
-    verifier.stats["last_input_tokens"] = int(getattr(usage, "input_tokens", 0) or 0)
+    # Deliberately the FINAL call's input, not the total: this field exists to
+    # compare an estimate against what the provider actually billed for one
+    # comparable request.
+    verifier.stats["last_input_tokens"] = int(
+        getattr(last_usage, "input_tokens", 0) or 0) if last_usage is not None else 0
     if severity == "none" or not finding_text:
         # Still record: cost must be measurable for reviews that find nothing,
         # otherwise the majority of spend is invisible.
@@ -790,7 +839,20 @@ def _run_review(state: SessionVerifier, delta_text: str,
         if _CTX is None:
             return
         if not _INFLIGHT.acquire(blocking=False):
-            logger.debug("verifier busy; skipping delta for %s", state.session_id)
+            # The cursor already advanced in handle_post_llm_call, so this delta
+            # is never reviewed by anyone. That used to be a debug line and
+            # nothing else: no counter, no event, nothing in status. A busy
+            # reviewer silently skipped turns, and the operator could not tell
+            # that from a quiet one.
+            with _LOCK:
+                state.reviews_dropped += 1
+            publish_event("review_skipped", {
+                "session_id": state.session_id,
+                "reason": "all review slots busy",
+                "origin_turn": origin_turn,
+            })
+            logger.warning("verifier busy; delta for %s was NOT reviewed",
+                           state.session_id)
             return
         try:
             with _LOCK:
@@ -798,6 +860,16 @@ def _run_review(state: SessionVerifier, delta_text: str,
             publish_event("review_started", {"session_id": state.session_id})
             try:
                 decision = _gate_decision(state, delta_text)
+                if getattr(decision, "usage", None) is not None:
+                    # Bill the decision to the session. The gate is the cheap half
+                    # of the design but it is not free, and a cost roll-up that
+                    # ignores it under-reports every turn the gate examined.
+                    gu = decision.usage
+                    with _LOCK:
+                        state.gate_input_tokens += int(
+                            getattr(gu, "input_tokens", 0) or 0)
+                        state.gate_output_tokens += int(
+                            getattr(gu, "output_tokens", 0) or 0)
                 with _LOCK:
                     state.last_gate = decision
                     state.gate_checked += 1
@@ -1312,6 +1384,9 @@ def snapshot() -> Dict[str, Any]:
                 "empty_responses": st.empty_responses,
                 "gate_checked": st.gate_checked,
                 "gate_skipped": st.gate_skipped,
+                "gate_input_tokens": st.gate_input_tokens,
+                "gate_output_tokens": st.gate_output_tokens,
+                "reviews_dropped": st.reviews_dropped,
                 "last_gate": ({"engage": st.last_gate.engage,
                                "effort": st.last_gate.tier,
                                "source": st.last_gate.source}
