@@ -556,6 +556,9 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
         # The authoritative number is usage.input_tokens, in the same row.
         "est_tokens": int((len(system_prompt) + len(transcript)) / 3.96),
     }
+    # Latest values for /verify status. Updated every review (not setdefault).
+    verifier.stats["est_tokens"] = parts["est_tokens"]
+    verifier.stats["last_input_tokens"] = int(getattr(usage, "input_tokens", 0) or 0)
     if severity == "none" or not finding_text:
         # Still record: cost must be measurable for reviews that find nothing,
         # otherwise the majority of spend is invisible.

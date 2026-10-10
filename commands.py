@@ -69,8 +69,18 @@ def _status_lines() -> List[str]:
         )
         total_empty = sum(s.get("empty_responses", 0)
                           for s in snap["sessions"].values())
+        # Latest per-review token figures. est is the tiktoken-based estimate;
+        # actual is what the provider billed, so the pair is directly checkable.
+        est = actual = 0
+        for s in snap["sessions"].values():
+            for v in (s.get("verifiers") or {}).values():
+                st = v.get("stats") or {}
+                est = max(est, int(st.get("est_tokens", 0) or 0))
+                actual = max(actual, int(st.get("last_input_tokens", 0) or 0))
+        tok_seg = f" | last review: ~{est} est / {actual} actual tokens" if actual else ""
         lines.append(
             f"  engagement: {total_reviews} review(s), {total_empty} empty response(s)"
+            f"{tok_seg}"
         )
 
     sessions = snap["sessions"]

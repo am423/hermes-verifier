@@ -1134,3 +1134,14 @@ def test_metrics_row_tracks_the_latest_review(ctx, monkeypatch):
     assert len(rows) == 2
     assert rows[1]["prompt_parts"]["transcript"] != rows[0]["prompt_parts"]["transcript"], \
         "the second review's sizes must differ (no setdefault freeze)"
+
+
+def test_status_reports_token_estimate(ctx, monkeypatch):
+    """The est-vs-actual pair must be visible, so A3 can be checked live."""
+    from verifier_pkg import commands
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
+    _turn(ctx)
+    text = "\n".join(commands._status_lines())
+    assert "est" in text and "actual tokens" in text, \
+        f"expected a token estimate in status, got:\n{text}"
