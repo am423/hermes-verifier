@@ -151,7 +151,6 @@ class SessionVerifier:
     consecutive_failures: int = 0
     empty_responses: int = 0
     last_error: str = ""
-    last_review_ts: float = 0.0
     roster_signature: Any = None
     reviews_used: int = 0
     turns_seen: int = 0
@@ -459,6 +458,7 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
         cap_kwargs = {"max_tokens": cap} if cap >= 1024 else {}
         transcript = delta_text
         result = None
+        empty_retried = False
         # Bounded: the advisor may verify a claim, then must produce its envelope.
         # A verifier with no grant is never told about tools, so it makes exactly
         # one call — parse_tool_call would refuse anyway, but skipping the loop
@@ -469,6 +469,22 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
                 ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
                 input_text=transcript, provider=provider, model=model, **cap_kwargs,
             )
+            # An empty completion surfaces as content_type="text" with no payload:
+            # _parse_structured_text returns (None, "text") on an empty body.
+            # Retry once, inside this try so the failure bookkeeping still applies.
+            if (not empty_retried and getattr(result, "parsed", None) is None
+                    and not getattr(result, "text", "")):
+                empty_retried = True
+                with _LOCK:
+                    state.empty_responses += 1
+                logger.warning(
+                    "verifier %s got an empty completion for %s (empty #%d); retrying",
+                    verifier.slug, state.session_id, state.empty_responses,
+                )
+                result = _call_structured(
+                    ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
+                    input_text=transcript, provider=provider, model=model, **cap_kwargs,
+                )
             call = tools_mod.parse_tool_call(getattr(result, "text", "") or "", grant)
             if call is None:
                 break
@@ -506,42 +522,26 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
             verifier.stats["cost_usd"] += float(cost)
     verifier.stats["model"] = getattr(result, "model", "") or ""
     verifier.stats["reviews"] += 1
-    state.last_review_ts = time.time()
 
     parsed = getattr(result, "parsed", None)
     if not isinstance(parsed, dict):
-        # An empty completion surfaces as content_type="text" with no payload:
-        # _parse_structured_text returns (None, "text") on an empty body. Retry
-        # once before giving up — a silent empty response must not look like
-        # "no finding", which is exactly how these were being lost.
+        # Non-empty but unparseable, or still empty after the in-loop retry.
+        # Both are surfaced rather than dropped silently.
         if result is not None and not getattr(result, "text", ""):
             with _LOCK:
-                state.empty_responses += 1
-            logger.warning(
-                "verifier %s got an empty completion for %s (empty #%d); retrying",
-                verifier.slug, state.session_id, state.empty_responses,
-            )
-            retry = _call_structured(
-                ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
-                input_text=delta_text, provider=provider, model=model, **cap_kwargs,
-            )
-            retry_parsed = getattr(retry, "parsed", None)
-            if isinstance(retry_parsed, dict):
-                result, parsed = retry, retry_parsed
-            else:
                 state.last_error = (
                     f"empty completion persisted after retry (empty #"
                     f"{state.empty_responses})"
                 )[:300]
-                publish_event("error", {"session_id": state.session_id,
-                                        "verifier": verifier.slug,
-                                        "error": state.last_error})
-                logger.warning("verifier %s still empty after retry for %s",
-                               verifier.slug, state.session_id)
-                return
+            publish_event("error", {"session_id": state.session_id,
+                                    "verifier": verifier.slug,
+                                    "error": state.last_error})
+            logger.warning("verifier %s still empty after retry for %s",
+                           verifier.slug, state.session_id)
         else:
-            logger.debug("verifier %s returned non-JSON for %s", verifier.slug, state.session_id)
-            return
+            logger.debug("verifier %s returned non-JSON for %s",
+                         verifier.slug, state.session_id)
+        return
     severity = str(parsed.get("severity") or "none").strip().lower()
     finding_text = str(parsed.get("finding") or "").strip()
     if severity == "none" or not finding_text:
