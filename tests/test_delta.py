@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from verifier_pkg import delta
 
 
@@ -109,3 +111,24 @@ def test_extract_delta_truncation_marker():
 def test_user_anchor_stable():
     assert delta.user_anchor("same message") == delta.user_anchor("same message")
     assert delta.user_anchor("same message") != delta.user_anchor("other")
+
+
+def test_tool_call_args_are_truncated_tighter():
+    """Tool-call args echo inflates the delta; the advisor needs intent, not payload.
+
+    A write_file call carrying a large file body, or a terminal call carrying a
+    long command, would otherwise dominate the delta and the token bill.
+    """
+    from verifier_pkg.delta import render_message
+    big = json.dumps({"path": "/tmp/x.py", "content": "code " * 500})
+    msg = {"role": "assistant", "content": "",
+           "tool_calls": [{"function": {"name": "write_file", "arguments": big}}]}
+    rendered = render_message(msg)
+    assert "write_file" in rendered, "the tool name must survive"
+    assert len(rendered) < 400, (
+        f"tool args must be tightly truncated, got {len(rendered)} chars"
+    )
+    # The payload is cut off well before the full body would fit.
+    assert rendered.count("code") < 40, (
+        f"payload still dominates the row: {rendered.count('code')} repeats"
+    )

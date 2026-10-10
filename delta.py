@@ -110,7 +110,10 @@ def render_message(message: Dict[str, Any], cap: int = 6000) -> str:
                 args = json.dumps(fn.get("arguments", {}), ensure_ascii=False)
             except (TypeError, ValueError):
                 args = str(fn.get("arguments", ""))
-            calls.append(f"{name}({args[:300]})")
+            # Tight cap: the advisor needs the tool and its intent, not the
+            # payload. A write_file body or a long command would otherwise
+            # dominate the delta and the token bill on every review.
+            calls.append(f"{name}({args[:120]})")
         content = (content + " " if content else "") + " | ".join(calls)
 
     tool_call_id = message.get("tool_call_id")
