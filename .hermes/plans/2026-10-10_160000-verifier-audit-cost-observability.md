@@ -544,3 +544,52 @@ hermes plugins doctor . --ci
 5. **Open question — is a token-based cap worth it?** After Task 1.5 there will be `est` vs `actual_in` per review for the first time. If the ratio is stable, a `max_delta_tokens` setting is justified. If it swings widely, a char cap plus telemetry is the better call. **Do not add the setting before that data exists.**
 
 6. **Explicitly out of scope:** Claude Code's server-side `advisor_20260301` tool and model-rank pairing (no Hermes hooks exist), and any change to `sync_backlog` — measured to be irrelevant to the loss in A4, and correctly `"off"`.
+
+---
+
+## Addendum — Can the advisor be told to answer within a token budget?
+
+Asked after Phase 4. Three mechanisms, one verified, one fixed, one unmeasured.
+
+### 1. Hard cap — EXISTS and works
+
+`advisor_max_tokens` is wired to the provider's `max_tokens` (`runtime.py`), with
+a documented 1024 minimum (provider constraint). Test:
+`test_advisor_max_tokens_reaches_the_provider` asserts the value reaches the call
+and that a sub-1024 value is ignored rather than sent and rejected.
+
+**Reliable.** This is the only mechanism that actually bounds output.
+
+### 2. JSON shape — FIXED, and it is what makes (1) safe
+
+Measured: `jsonschema` rejected `{"severity","finding"}` with
+`'reasoning' is a required property`. All three fields were required, so a
+response truncated by the cap after `finding` lost the **entire** review — even
+though `finding` is the whole deliverable and `reasoning` is diagnostics only.
+
+Observed field sizes (n=12 findings): `finding` 856–1235 chars, `reasoning`
+124–240 chars, output 271–1346 tokens (mean 939).
+
+`required` is now `["severity", "finding"]`. Truncation degrades to
+"no diagnostics" instead of "no review".
+
+Also fixed: an unparseable (non-empty, non-JSON) response left `last_error`
+empty and logged at `debug`, so it was indistinguishable from "the advisor found
+nothing". It now sets `last_error` and emits an error event.
+
+### 3. Prompt instruction — PRESENT but UNMEASURED
+
+The system prompt says "Keep findings under 200 words" (~300 tokens); observed
+findings average 939 output tokens, so it was being missed by ~3x. A stronger,
+token-aware instruction was added — **but its effect is NOT measured**: the
+one-shot probes that ran after the change all returned `severity: none` (no
+findings to compare), and the desktop session was running a stale in-memory
+copy of the plugin. Treat the instruction as advisory and unproven.
+
+### What is safe to claim
+
+- A hard output cap is available and now cannot destroy a review on truncation.
+- At the 1024 floor it would clip a meaningful share of current findings
+  (mean 939, max 1346), costing detail, not the review.
+- Prompt-level budget instructions should not be relied on; the prompt already
+  asked for brevity and the model exceeded it ~3x.
