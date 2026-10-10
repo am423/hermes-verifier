@@ -1093,3 +1093,44 @@ def test_status_surfaces_engagement_counters(ctx, monkeypatch):
     text = "\n".join(commands._status_lines())
     assert "engagement:" in text, "the engagement line must be present"
     assert "1 review(s)" in text, f"expected 1 review, got:\n{text}"
+
+
+# ── Cost telemetry: every review is recorded ─────────────────────────────────
+
+
+def test_every_review_writes_a_metrics_row(ctx, monkeypatch):
+    """A no-finding review must still produce telemetry.
+
+    Regression: _record_and_deliver sat after the severity=='none' early
+    return, so reviews that found nothing left no trace and cost was
+    unmeasurable.
+    """
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
+    _turn(ctx)
+
+    log = runtime._log_path("s1", "default")
+    rows = [json.loads(l) for l in log.read_text().splitlines()]
+    assert len(rows) == 1, "a none-review must still write a row"
+    assert rows[0]["severity"] == "none"
+
+    parts = rows[0]["prompt_parts"]
+    assert parts["transcript"] > 0
+    assert parts["system_prompt"] > 0
+    assert rows[0]["usage"]["input_tokens"] >= 0
+
+
+def test_metrics_row_tracks_the_latest_review(ctx, monkeypatch):
+    """Sizes must update per review, not freeze at the first one."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
+    _turn(ctx)
+    # Each turn needs its own response: FakeLlm consumes `next` per call.
+    ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
+    _turn(ctx, history=[{"role": "user", "content": "x" * 500}], response="y" * 500)
+
+    log = runtime._log_path("s1", "default")
+    rows = [json.loads(l) for l in log.read_text().splitlines()]
+    assert len(rows) == 2
+    assert rows[1]["prompt_parts"]["transcript"] != rows[0]["prompt_parts"]["transcript"], \
+        "the second review's sizes must differ (no setdefault freeze)"

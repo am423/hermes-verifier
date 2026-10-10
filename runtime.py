@@ -386,7 +386,8 @@ def _call_structured(ctx: Any, *, system_prompt: str, instructions: str,
 
 def _record_and_deliver(state: SessionVerifier, verifier: Verifier,
                         parsed: Dict[str, Any], accepted: bool,
-                        usage: Any, delta_excerpt: str = "") -> None:
+                        usage: Any, delta_excerpt: str = "",
+                        prompt_parts: Optional[Dict[str, Any]] = None) -> None:
     severity = str(parsed.get("severity") or "none").strip().lower()
     finding_text = str(parsed.get("finding") or "").strip()
     reasoning = str(parsed.get("reasoning") or "").strip()
@@ -400,6 +401,7 @@ def _record_and_deliver(state: SessionVerifier, verifier: Verifier,
         "accepted": accepted,
         "model": verifier.stats["model"],
         "delta_excerpt": delta_excerpt[:2000],
+        "prompt_parts": prompt_parts or {},
         "usage": {
             "input_tokens": getattr(usage, "input_tokens", 0),
             "output_tokens": getattr(usage, "output_tokens", 0),
@@ -544,11 +546,25 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
         return
     severity = str(parsed.get("severity") or "none").strip().lower()
     finding_text = str(parsed.get("finding") or "").strip()
+    parts = {
+        "system_prompt": len(system_prompt),
+        "instructions": len(brief.REVIEW_TASK),
+        "transcript": len(transcript),
+        # Token estimate for budget tuning. 3.96 chars/token is MEASURED with
+        # tiktoken/cl100k_base on realistic max-size deltas — but tiktoken is a
+        # proxy, not the provider's tokenizer, so treat this as indicative only.
+        # The authoritative number is usage.input_tokens, in the same row.
+        "est_tokens": int((len(system_prompt) + len(transcript)) / 3.96),
+    }
     if severity == "none" or not finding_text:
+        # Still record: cost must be measurable for reviews that find nothing,
+        # otherwise the majority of spend is invisible.
+        _record_and_deliver(state, verifier, parsed, False, usage,
+                            delta_excerpt=delta_text, prompt_parts=parts)
         return
     accepted = verifier.guard.accept(severity, finding_text)
     _record_and_deliver(state, verifier, parsed, accepted, usage,
-                        delta_excerpt=delta_text)
+                        delta_excerpt=delta_text, prompt_parts=parts)
 
 
 def _run_review(state: SessionVerifier, delta_text: str) -> None:
