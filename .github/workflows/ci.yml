@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test deps
+        run: pip install pytest pyyaml
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Validate plugin
+        run: |
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          export PATH="$HOME/.local/bin:$PATH"
+          hermes plugins validate . --ci

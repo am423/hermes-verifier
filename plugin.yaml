@@ -1,13 +1,15 @@
 name: hermes-verifier
-version: 0.1.0
+version: 0.2.0
 description: >-
   Attach an independent verifier model to your Hermes session: it reviews each
-  primary-agent turn delta, raises findings (note / caution / blocker), and
-  steers them back into the session before the primary agent goes wrong.
+  primary-agent turn delta, verifies claims with read-only tools, raises findings
+  (note / caution / blocker), and steers them back into the session before the
+  primary agent goes wrong.
 author: "am423"
 license: MIT
 manifest_version: 2
 api_version: 1
+requires_hermes: ">=0.21.5"
 homepage: https://github.com/am423/hermes-verifier
 tags: [desktop, session, review, verifier]
 provides_hooks:
