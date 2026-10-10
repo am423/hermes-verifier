@@ -1243,22 +1243,30 @@ def test_schema_accepts_response_without_reasoning(ctx, monkeypatch):
 
 
 def test_advisor_max_tokens_reaches_the_provider(ctx, monkeypatch):
-    """The output cap must actually be sent, and must not fire below 1024.
+    """The output cap must actually be sent, clamped up to the provider minimum.
 
-    Provider minimum is 1024, so a lower value is ignored rather than sent and
-    rejected — plugin.yaml says the same.
+    Provider minimum is 1024. A CONFIGURED value below that is clamped up to it,
+    not dropped: dropping it sends no max_tokens at all, so an operator who set
+    advisor_max_tokens: 500 to LIMIT spend would get unbounded output -- the
+    inverse of what the setting is for. This test previously asserted the drop.
     """
     monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
 
-    # Below the provider minimum: not sent at all.
+    # Below the provider minimum: clamped UP to the floor, still sent.
     ctx.config["advisor_max_tokens"] = 500
     ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
     _turn(ctx)
-    assert "max_tokens" not in ctx.llm.calls[-1], \
-        "a sub-1024 cap must be ignored, not sent"
+    assert ctx.llm.calls[-1].get("max_tokens") == runtime._MIN_ADVISOR_TOKENS, \
+        "a sub-1024 cap must be clamped to the floor, not silently dropped"
 
-    # At or above the minimum: sent through.
+    # At or above the minimum: sent through unchanged.
     ctx.config["advisor_max_tokens"] = 1200
     ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
     _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
     assert ctx.llm.calls[-1].get("max_tokens") == 1200
+
+    # Unset: no cap sent, so the provider default applies.
+    ctx.config["advisor_max_tokens"] = 0
+    ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
+    _turn(ctx, history=[{"role": "user", "content": "t3"}], response="a3")
+    assert "max_tokens" not in ctx.llm.calls[-1]

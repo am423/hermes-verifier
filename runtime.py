@@ -86,6 +86,10 @@ _INFLIGHT = threading.BoundedSemaphore(_MAX_INFLIGHT)
 # the second accepted finding silently overwrite the first.
 _MAX_PENDING = 5
 
+# Under this, a review response is truncated mid-JSON and the whole review is
+# lost, so it is a FLOOR: a smaller configured cap is clamped up, never dropped.
+_MIN_ADVISOR_TOKENS = 1024
+
 _BACKLOG_WAIT_CAP = 30.0
 _BACKLOG_POLL = 0.1
 
@@ -539,14 +543,21 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
             block = tools_mod.render_available(grant)
             if block:
                 system_prompt = f"{system_prompt}\n\n{block}"
-        cap = int(_config(ctx, "advisor_max_tokens", 0) or 0)
+        cap = safe_int(_config(ctx, "advisor_max_tokens", 0))
         if effort == "routine":
             # The gate judged this turn trivial. Hold the review to a smaller
-            # output budget -- but never below 1024, the measured floor under which
-            # a response is truncated mid-JSON and the whole review is lost.
-            routine_cap = int(_config(ctx, "advisor_routine_tokens", 1024) or 1024)
+            # output budget, still subject to the floor below.
+            routine_cap = safe_int(
+                _config(ctx, "advisor_routine_tokens", _MIN_ADVISOR_TOKENS),
+                _MIN_ADVISOR_TOKENS)
             cap = min(cap, routine_cap) if cap else routine_cap
-        cap_kwargs = {"max_tokens": cap} if cap >= 1024 else {}
+        # A cap below the floor is clamped UP, not dropped. Dropping it sends no
+        # max_tokens at all, so an operator who set advisor_max_tokens: 500 to
+        # LIMIT spend got unbounded output -- the inverse of the setting's
+        # purpose, and plugin.yaml documents 1024 as the minimum when set.
+        if cap:
+            cap = max(cap, _MIN_ADVISOR_TOKENS)
+        cap_kwargs = {"max_tokens": cap} if cap else {}
         transcript = delta_text
         result = None
         empty_retried = False
@@ -1047,6 +1058,11 @@ def handle_pre_verify(session_id: Any = "", **kwargs: Any) -> Optional[Dict[str,
     frequency, and the host bounds nudges via agent.max_verify_nudges.
     """
     if not _config(_CTX, "blocker_steer", True):
+        return None
+    if not subsystem_enabled(session_id):
+        # A disabled session must not be interrupted, including by a blocker
+        # already queued when it was turned off. The finding stays pending, so
+        # re-enabling the verifier still delivers it.
         return None
     state = _get_state(session_id, create=False)
     if state is None:

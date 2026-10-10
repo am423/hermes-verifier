@@ -71,3 +71,34 @@ def test_status_survives_a_hostile_non_numeric_setting(ctx):  # noqa: F811
     except ValueError as exc:  # pragma: no cover - that is the bug
         raise AssertionError(f"/verify status crashed on a bad setting: {exc}")
     assert lines, "status must still produce output"
+
+
+def test_a_disabled_session_is_not_interrupted_by_a_queued_blocker(ctx):  # noqa: F811
+    """/verify off must stop the verifier interrupting, including by a blocker
+    already queued. The finding stays pending so re-enabling still delivers it."""
+    state = runtime._get_state("s1")
+    verifier = state.verifiers["default"]
+    verifier.pending.clear()
+    runtime._record_and_deliver(
+        state, verifier,
+        {"severity": "blocker", "finding": "stop the line", "reasoning": ""},
+        True, None, origin_turn=1,
+    )
+
+    # Disable the session. Zero the immunity clock too, so the ONLY thing that
+    # can suppress the steer is the enablement check under test -- otherwise
+    # immunity would make this pass for the wrong reason.
+    runtime.set_session_override("s1", False)
+    state.immunity_left = 0
+    try:
+        assert runtime.handle_pre_verify(session_id="s1") is None, (
+            "a disabled session was interrupted anyway"
+        )
+        assert verifier.pending, "the blocker must stay queued for re-enable"
+    finally:
+        runtime.set_session_override("s1", True)
+
+    # Re-enabled, it steers again -- proving the finding was preserved, not eaten.
+    state.immunity_left = 0
+    assert runtime.handle_pre_verify(session_id="s1") is not None
+    assert not verifier.pending, "steering consumes the blocker"
