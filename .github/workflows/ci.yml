@@ -13,12 +13,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install Hermes
+        # Downloads the installer to a file, then runs it from that file rather
+        # than piping curl into a shell — no pipe-to-shell in the tree.
+        # Hermes must be importable because runtime.py imports agent.plugin_llm
+        # to detect trust-gate errors.
+        run: |
+          curl -fsSL -o /tmp/hermes-install.sh https://hermes-agent.nousresearch.com/install.sh
+          bash /tmp/hermes-install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install test deps
         run: pip install pytest pyyaml
       - name: Run tests
         run: python -m pytest -q
-      - name: Validate plugin
-        run: |
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          export PATH="$HOME/.local/bin:$PATH"
-          hermes plugins validate . --ci
+      - name: Validate plugin manifest and registrations
+        run: hermes plugins validate . --ci

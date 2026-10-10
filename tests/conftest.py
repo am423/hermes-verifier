@@ -27,3 +27,21 @@ if not link.exists():
 
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
+
+# runtime.py imports ``agent.plugin_llm`` to detect trust-gate errors. That module
+# only exists inside a Hermes install, so stub it here: the suite must pass on a
+# bare checkout (CI, forks) without Hermes present. The stub exposes a distinct
+# PluginLlmTrustError so trust-error classification stays testable.
+if "agent" not in sys.modules:
+    import types
+
+    _agent = types.ModuleType("agent")
+    _plugin_llm = types.ModuleType("agent.plugin_llm")
+
+    class PluginLlmTrustError(Exception):
+        """Stand-in for the host's trust-gate error."""
+
+    _plugin_llm.PluginLlmTrustError = PluginLlmTrustError
+    _agent.plugin_llm = _plugin_llm
+    sys.modules.setdefault("agent", _agent)
+    sys.modules.setdefault("agent.plugin_llm", _plugin_llm)
