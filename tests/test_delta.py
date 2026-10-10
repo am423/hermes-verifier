@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from verifier_pkg import delta
 
 
@@ -243,3 +245,48 @@ def test_a_short_delta_is_untouched():
     _, text = delta.extract_delta(cursor_len=None, conversation_history=history,
                                   assistant_response="done", max_chars=20000)
     assert "truncated" not in text
+
+
+# ── Redaction must survive real-world labelling and ordering ────────────────
+#
+# The reviewer prompt promises "you never see secrets" (brief.py). These pin the
+# two ways that promise was broken: labels embedded in longer names / quoted in
+# JSON, and truncation running BEFORE redaction.
+
+SECRET_SHAPES = [
+    ("bare", "api_key=sk-live-abcdef1234567890", "sk-live"),
+    ("prefixed env", "OPENAI_API_KEY=sk-proj-abcdef1234567890", "sk-proj"),
+    ("aws long name", "aws_secret_access_key = wJalrXUtnFEMIK7MDENGbPxRfiCY", "wJalr"),
+    ("json quoted", '{"password": "hunter2secret", "api_key": "sk-live-abcdef1234"}', "hunter2secret"),
+    ("uppercase prefix", "MY_TOKEN=abcdef1234567890abcdef", "abcdef1234567890abcdef"),
+    ("github prefixed", "GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz", "ghp_abcdefghij"),
+]
+
+
+@pytest.mark.parametrize("label,text,secret", SECRET_SHAPES)
+def test_redaction_covers_prefixed_and_quoted_labels(label, text, secret):
+    out = delta.redact(text)
+    assert secret not in out, f"{label}: secret survived redaction -> {out!r}"
+
+
+def test_redaction_does_not_mangle_ordinary_prose():
+    """Widening the label pattern must not start eating normal sentences."""
+    for prose in ("the token count is stable across turns",
+                  "we discussed the secret handling policy in depth",
+                  "added a password reset endpoint"):
+        assert "REDACTED" not in delta.redact(prose), prose
+
+
+def test_a_long_private_key_is_redacted_before_truncation():
+    """Truncating first cut the END marker, so the PEM pattern could not match
+    and the key body shipped intact."""
+    body = "MIIEowIBAAKCAQEA" + ("b" * 2200)
+    pem = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----"
+    assert len(pem) > delta._TOOL_RESULT_CAP, "precondition: longer than the cap"
+
+    rendered = delta.render_message({"role": "tool", "tool_call_id": "c" * 12,
+                                     "content": pem})
+    assert "MIIEowIBAAKCAQEA" not in rendered, (
+        "the key body reached the reviewer; redaction must precede truncation"
+    )
+    assert "[REDACTED:private-key]" in rendered

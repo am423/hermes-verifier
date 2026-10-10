@@ -41,8 +41,15 @@ _REDACTIONS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"Bearer\s+[A-Za-z0-9._-]{12,}"), "Bearer [REDACTED]"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
                 re.DOTALL), "[REDACTED:private-key]"),
-    (re.compile(r"(?i)\b(api_key|apikey|api-key|secret|password|passwd|token)"
-                r"\s*[:=]\s*[\"']?[^\s\"'<>]{6,}[\"']?"),
+    # The label may be EMBEDDED in a longer name (OPENAI_API_KEY,
+    # aws_secret_access_key, MY_TOKEN) and may be quoted ({"password": "..."}).
+    # Anchoring with \b failed the moment the name was prefixed -- \b does not
+    # fire between "_" and "a" -- and requiring the separator immediately after
+    # the label failed on JSON, where a closing quote sits in between. Both
+    # leaked in practice, in a component whose prompt promises the reviewer
+    # "never sees secrets".
+    (re.compile(r"(?i)([\w-]*(?:api[_-]?key|secret|password|passwd|token)[\w-]*)"
+                r"[\"']?\s*[:=]\s*[\"']?[^\s\"'<>]{6,}[\"']?"),
      r"\1 [REDACTED]"),
 ]
 
@@ -127,11 +134,16 @@ def render_message(message: Dict[str, Any], cap: int = 6000) -> str:
     role_label = role
     if role == "tool" and tool_call_id:
         role_label = f"tool({tool_call_id[:12]})"
-        if len(content) > _TOOL_RESULT_CAP:
-            content = content[:_TOOL_RESULT_CAP] + "\n… [tool result truncated]"
 
-    text = redact(strip_findings(content))
-    return f"[{role_label}] {text}"[:cap]
+    # Redact BEFORE truncating. Truncation used to run first, so a private key
+    # longer than _TOOL_RESULT_CAP was cut before its "-----END ... KEY-----"
+    # marker -- the PEM pattern could no longer match, and the key body reached
+    # the reviewer intact. Redaction has to see the whole value to recognise it.
+    content = redact(strip_findings(content))
+    if role == "tool" and tool_call_id and len(content) > _TOOL_RESULT_CAP:
+        content = content[:_TOOL_RESULT_CAP] + "\n… [tool result truncated]"
+
+    return f"[{role_label}] {content}"[:cap]
 
 
 def extract_delta(

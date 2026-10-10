@@ -590,7 +590,12 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
             call = tools_mod.parse_tool_call(getattr(result, "text", "") or "", grant)
             if call is None:
                 break
-            output = tools_mod.dispatch(ctx, call)
+            # The reviewer prompt promises "you never see secrets" (brief.py).
+            # That held for the transcript delta, but tool output was spliced in
+            # RAW -- a read_file over a config or key file shipped the secret
+            # straight to the model, and tool grants are on by default here.
+            output = delta_mod.redact(str(tools_mod.dispatch(ctx, call)))
+            output = output[:delta_mod._TOOL_RESULT_CAP]
             transcript = (
                 f"{delta_text}\n\n---\nTool result from {call['tool']}:\n{output}\n"
                 "Now give your final review envelope (severity/finding/reasoning)."
