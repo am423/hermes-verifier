@@ -43,7 +43,7 @@ config_schema:
   max_delta_chars:
     type: int
     default: 20000
-    description: "Cap on the rendered transcript delta sent to the verifier."
+    description: "Cap on the rendered transcript delta sent to the advisor, in CHARACTERS. Measured: the provider bills ~1.60 chars/token on agent transcripts, so 20000 chars is roughly 12,500 billed tokens per review. Lower it to cut cost."
   blocker_steer:
     type: bool
     default: true

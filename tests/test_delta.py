@@ -154,3 +154,15 @@ def test_tool_result_rows_are_capped_in_the_delta():
     assert len(rendered) < 4000, (
         f"tool results must be capped per row, got {len(rendered)} chars"
     )
+
+
+def test_delta_truncation_marks_and_bounds():
+    """The cap must bound output and say so, so a cut review is visible."""
+    hist = [{"role": "tool", "tool_call_id": "c1",
+             "content": "\n".join(f"line {i}" for i in range(3000))} for _ in range(12)]
+    _cursor, rendered = delta.extract_delta(
+        cursor_len=None, conversation_history=hist,
+        assistant_response="done", max_chars=2000,
+    )
+    assert len(rendered) <= 2000 + len("\n… [delta truncated]") + 1
+    assert rendered.endswith("[delta truncated]"), "a cut delta must be marked"
