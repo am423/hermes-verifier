@@ -602,3 +602,55 @@ def test_advisor_tools_off_by_default(ctx, monkeypatch):
     assert len(ctx.llm.calls) == 1
     assert dispatched == []
     assert "TOOL_CALL" not in ctx.llm.calls[0]["system_prompt"]
+
+
+# ── Review budget (max_uses, session-scoped) ─────────────────────────────────
+
+
+def test_review_budget_blocks_after_cap(ctx, monkeypatch):
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["max_reviews_per_session"] = 2
+    ctx.llm.next = FakeResult({"severity": "note", "finding": "nit: rename x",
+                               "reasoning": ""})
+
+    _turn(ctx)
+    _turn(ctx, history=[{"role": "user", "content": "again"}], response="second")
+    state = runtime._get_state("s1", create=False)
+    assert state.reviews_used == 2
+
+    _turn(ctx, history=[{"role": "user", "content": "third"}], response="third")
+    assert state.reviews_used == 2, "budget exhausted — no further reviews"
+    assert len(ctx.llm.calls) == 2, "no provider call may be made past the cap"
+
+
+def test_review_budget_unlimited_by_default(ctx, monkeypatch):
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.next = FakeResult({"severity": "note", "finding": "nit: rename x",
+                               "reasoning": ""})
+    for i in range(4):
+        _turn(ctx, history=[{"role": "user", "content": f"t{i}"}], response=f"a{i}")
+    assert runtime._get_state("s1", create=False).reviews_used == 4
+
+
+def test_budget_resets_on_session_reset(ctx, monkeypatch):
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["max_reviews_per_session"] = 1
+    ctx.llm.next = FakeResult({"severity": "note", "finding": "nit: rename x",
+                               "reasoning": ""})
+    _turn(ctx)
+    runtime.handle_session_reset(session_id="s1")
+    _turn(ctx, history=[{"role": "user", "content": "again"}], response="again")
+    assert runtime._get_state("s1", create=False).reviews_used == 1
+
+
+def test_budget_counts_attempts_not_successes(ctx, monkeypatch):
+    """A failing review still consumes budget — it is a cost control."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["max_reviews_per_session"] = 1
+    ctx.llm.raise_error = RuntimeError("provider down")
+
+    _turn(ctx)
+
+    state = runtime._get_state("s1", create=False)
+    assert state.reviews_used == 1
+    assert state.consecutive_failures == 1

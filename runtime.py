@@ -143,6 +143,7 @@ class SessionVerifier:
     last_error: str = ""
     last_review_ts: float = 0.0
     roster_revision: int = 0
+    reviews_used: int = 0
 
     def ensure_verifiers(self, roster: List[Dict[str, Any]]) -> None:
         """Rebuild the verifier list when the roster changes."""
@@ -183,6 +184,7 @@ class SessionVerifier:
         self.immunity_left = 0
         self.backlog = 0
         self.reviewing = False
+        self.reviews_used = 0
         for verifier in self.verifiers.values():
             verifier.reset()
 
@@ -506,6 +508,16 @@ def _run_review(state: SessionVerifier, delta_text: str) -> None:
 
 
 def _schedule_review(state: SessionVerifier, delta_text: str) -> None:
+    # Claude Code caps advisor calls per request (max_uses); OMP has no cap at
+    # all, so a noisy roster silently runs up bill. This is the session-scoped
+    # version. The counter increments before dispatch, so a review that fails
+    # still consumes budget — that is what makes it a cost control.
+    cap = int(_config(_CTX, "max_reviews_per_session", 0) or 0)
+    with _LOCK:
+        if cap and state.reviews_used >= cap:
+            logger.debug("review budget exhausted for %s (%d)", state.session_id, cap)
+            return
+        state.reviews_used += 1
     if _REVIEW_FN_OVERRIDE is not None:
         _REVIEW_FN_OVERRIDE(state, delta_text)
         return
