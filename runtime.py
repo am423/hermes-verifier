@@ -399,7 +399,7 @@ def _record_and_deliver(state: SessionVerifier, verifier: Verifier,
         "reasoning": reasoning,
         "accepted": accepted,
         "model": verifier.stats["model"],
-        "delta_excerpt": delta_excerpt[:400],
+        "delta_excerpt": delta_excerpt[:2000],
         "usage": {
             "input_tokens": getattr(usage, "input_tokens", 0),
             "output_tokens": getattr(usage, "output_tokens", 0),
@@ -522,6 +522,14 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
             verifier.stats["cost_usd"] += float(cost)
     verifier.stats["model"] = getattr(result, "model", "") or ""
     verifier.stats["reviews"] += 1
+
+    # Record what actually went to the provider so cost can be attributed to a
+    # real component (system prompt vs instructions vs delta) instead of guessed.
+    verifier.stats.setdefault("prompt_parts", {
+        "system_prompt": len(system_prompt),
+        "instructions": len(brief.REVIEW_TASK),
+        "transcript": len(transcript),
+    })
 
     parsed = getattr(result, "parsed", None)
     if not isinstance(parsed, dict):
