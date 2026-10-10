@@ -684,18 +684,24 @@ def test_nudge_stops_after_n_turns(ctx):
         session_id="s1", user_message="m", conversation_history=[]) is None
 
 
-def test_nudge_counts_turns_even_when_subsystem_off(ctx):
-    """The nudge window tracks real turns regardless of the enable state."""
+def test_nudge_counts_turns_while_enabled(ctx):
+    """The nudge window advances per turn while the subsystem is enabled.
+
+    While disabled the handler returns before materializing a session (see
+    test_pre_llm_call_does_not_leak_sessions), so the window starts counting
+    from the first enabled turn rather than from an earlier disabled one.
+    """
     ctx.config["nudge_first_turns"] = 2
-    ctx.config["enabled"] = False
+    ctx.config["enabled"] = True
+    assert runtime.handle_pre_llm_call(
+        session_id="s1", user_message="m", conversation_history=[]) is not None
+    assert runtime.handle_pre_llm_call(
+        session_id="s1", user_message="m", conversation_history=[]) is not None
+    state = runtime._get_state("s1", create=False)
+    assert state.turns_seen == 2
+    # Window closed after 2 turns.
     assert runtime.handle_pre_llm_call(
         session_id="s1", user_message="m", conversation_history=[]) is None
-    state = runtime._get_state("s1", create=False)
-    assert state.turns_seen == 1
-    ctx.config["enabled"] = True
-    injected = runtime.handle_pre_llm_call(
-        session_id="s1", user_message="m", conversation_history=[])
-    assert injected is not None, "second turn is still inside the nudge window"
 
 
 # ── Status surfacing ─────────────────────────────────────────────────────────
@@ -715,3 +721,98 @@ def test_status_budget_unlimited_by_default(ctx):
     from verifier_pkg import commands
     text = "\n".join(commands._status_lines())
     assert "review budget: unlimited" in text
+
+
+# ── Gap fixes: live roster/default_tools, session hygiene, dashboard parity ──
+
+
+def test_roster_grants_refresh_mid_session(ctx, monkeypatch):
+    """GAP 1: a roster written after session creation must still take effect.
+
+    ensure_verifiers only ran at creation, so a VERIFIER.yml edited (or a
+    default_tools change made) while a session was live was ignored until the
+    next session. The grant now re-resolves each turn.
+    """
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    runtime._ROSTER_OVERRIDE = []                       # created with no roster
+    ctx.llm.next = FakeResult({"severity": "note", "finding": "nit", "reasoning": ""})
+    _turn(ctx)
+    state = runtime._get_state("s1", create=False)
+    assert state.verifiers["default"].tool_grant == []
+
+    # Operator edits VERIFIER.yml mid-session.
+    runtime._ROSTER_OVERRIDE = [{
+        "name": "Claims", "slug": "claims", "enabled": True,
+        "model": "", "tools": ["read_file"], "instructions": "",
+    }]
+    ctx.llm.next = FakeResult({"severity": "note", "finding": "nit2", "reasoning": ""})
+    _turn(ctx, history=[{"role": "user", "content": "again"}], response="again")
+
+    assert "claims" in state.verifiers, "roster change must be picked up mid-session"
+    assert state.verifiers["claims"].tool_grant == ["read_file"]
+
+
+def test_default_tools_refresh_mid_session(ctx, monkeypatch):
+    """GAP 2: changing default_tools must re-resolve the live grant."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.next = FakeResult({"severity": "note", "finding": "nit", "reasoning": ""})
+    _turn(ctx)
+    state = runtime._get_state("s1", create=False)
+    assert state.verifiers["default"].tool_grant == []
+
+    ctx.config["default_tools"] = ["read_file", "terminal"]   # terminal refused
+    _turn(ctx, history=[{"role": "user", "content": "again"}], response="again")
+
+    assert state.verifiers["default"].tool_grant == ["read_file"]
+
+
+def test_pre_llm_call_does_not_leak_sessions(ctx):
+    """GAP 3: pre_llm_call must not materialize a session for a turn that
+    never produced a review — otherwise disabled/short sessions accumulate
+    state that never gets used."""
+    ctx.config["enabled"] = False                       # subsystem off
+    runtime.handle_pre_llm_call(session_id="ghost", user_message="hi",
+                                conversation_history=[])
+    assert runtime._get_state("ghost", create=False) is None, \
+        "a disabled session must not be materialized by pre_llm_call"
+
+    # With the subsystem on, the session is created (it must be, to hold state).
+    ctx.config["enabled"] = True
+    ctx.config["nudge_first_turns"] = 1
+    runtime.handle_pre_llm_call(session_id="live", user_message="hi",
+                                conversation_history=[])
+    assert runtime._get_state("live", create=False) is not None
+
+
+def test_dashboard_state_exposes_new_settings():
+    """GAP 4: the dashboard /state payload must expose the new controls so the
+    UI does not silently disagree with /verify status."""
+    import sys
+    import types
+    mod = types.ModuleType("fake_api_mod")
+
+    api_path = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("hv_plugin_api", api_path)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["hv_plugin_api"] = m
+    spec.loader.exec_module(m)
+
+    m._plugin_settings = lambda: {
+        "enabled": True, "verifier_model": "a/b", "sync_backlog": "off",
+        "immunity_turns": 3, "max_delta_chars": 20000, "blocker_steer": True,
+        "advisor_tools": True, "default_tools": ["read_file"],
+        "max_reviews_per_session": 7, "advisor_max_tokens": 1024,
+        "nudge_first_turns": 2,
+    }
+    m._primary_model = lambda: None
+    m._transcript_from_disk = lambda *a, **k: []
+    m.runtime = types.SimpleNamespace(last_event_seq=lambda: 0,
+                                      designated_session=lambda: None)
+    payload = m._state_payload()
+    s = payload["settings"]
+    assert s["advisor_tools"] is True
+    assert s["default_tools"] == ["read_file"]
+    assert s["max_reviews_per_session"] == 7
+    assert s["advisor_max_tokens"] == 1024
+    assert s["nudge_first_turns"] == 2

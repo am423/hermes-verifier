@@ -122,8 +122,8 @@ hermes-verifier/               ← install root (~/.hermes/plugins/hermes-verifi
 ├── desktop/
 │   └── plugin.js              ← Verifier Mode page (route /verifier)
 ├── skills/hermes-verifier/SKILL.md
-├── tests/                     ← 84 tests: guard, delta, runtime, roster, backlog,
-│                                budget, nudge, advisor tools, events
+├── tests/                     ← 88 tests: guard, delta, runtime, roster, backlog,
+│                                budget, nudge, advisor tools, gaps, events
 ├── pytest.ini                 ← importlib mode: keeps pytest off the hyphenated root package
 ├── docs/design.md             ← full architecture and behavior spec
 └── PLAN.md                    ← milestone checklist

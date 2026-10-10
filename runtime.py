@@ -151,7 +151,7 @@ class SessionVerifier:
     consecutive_failures: int = 0
     last_error: str = ""
     last_review_ts: float = 0.0
-    roster_revision: int = 0
+    roster_signature: Any = None
     reviews_used: int = 0
     turns_seen: int = 0
 
@@ -196,6 +196,7 @@ class SessionVerifier:
         self.reviewing = False
         self.reviews_used = 0
         self.turns_seen = 0
+        self.roster_signature = None
         for verifier in self.verifiers.values():
             verifier.reset()
 
@@ -216,6 +217,29 @@ def _get_state(session_id: Any, create: bool = True) -> Optional[SessionVerifier
             state.ensure_verifiers(discover_roster())
             _SESSIONS[key] = state
         return state
+
+
+def _sync_roster(state: SessionVerifier) -> None:
+    """Re-resolve the roster and tool grants for a live session.
+
+    ``ensure_verifiers`` only ran at session creation, so a ``VERIFIER.yml``
+    edited mid-session — or a ``default_tools`` change made from Settings —
+    was silently ignored until the next session. Cheap to re-run (a dict
+    comparison of slugs plus one setting read), so it runs at every turn.
+    """
+    roster = discover_roster()
+    signature = [(str(e.get("slug") or e.get("name")), bool(e.get("enabled", True)),
+                  str(e.get("model") or ""), tuple(e.get("tools") or []),
+                  str(e.get("instructions") or "")) for e in roster]
+    if signature != state.roster_signature:
+        state.roster_signature = signature
+        state.ensure_verifiers(roster)
+        return
+    # Same roster shape, but default_tools / advisor_tools may still have moved.
+    default_grant = _config(_CTX, "default_tools", []) or []
+    resolved = tools_mod.resolve_grant(default_grant)
+    if resolved != state.verifiers[DEFAULT_VERIFIER].tool_grant:
+        state.verifiers[DEFAULT_VERIFIER].tool_grant = resolved
 
 
 def bind_ctx(ctx: Any) -> None:
@@ -654,6 +678,7 @@ def handle_post_llm_call(
             return
         with _LOCK:
             _RECENT_SESSION = state.session_id
+        _sync_roster(state)
         max_chars = int(_config(_CTX, "max_delta_chars", 20000) or 20000)
         new_cursor, delta_text = delta_mod.extract_delta(
             cursor_len=state.cursor_len,
@@ -680,19 +705,21 @@ def handle_pre_llm_call(session_id: Any = "", **kwargs: Any) -> Optional[Dict[st
     preserved — injecting into the user message is the documented cache-safe
     path.
     """
+    # Only materialize a session when the subsystem is actually enabled for it:
+    # a hook firing for an unrelated or disabled session must not create state
+    # that lingers in _SESSIONS. The nudge window needs a session to count in,
+    # so it is checked after enablement but before any early return.
+    if not subsystem_enabled(session_id):
+        return None
     state = _get_state(session_id)
     if state is None:  # pragma: no cover - create=True above
         return None
-    # The nudge window tracks real turns even when the subsystem is off, so
-    # enabling it mid-session does not restart the count.
     nudge_turns = int(_config(_CTX, "nudge_first_turns", 0) or 0)
     nudge = None
     with _LOCK:
         if nudge_turns and state.turns_seen < nudge_turns:
             nudge = NUDGE_TEXT
         state.turns_seen += 1
-    if not subsystem_enabled(session_id):
-        return None
     with _LOCK:
         pending = {slug: v.pending for slug, v in state.verifiers.items()
                    if v.pending is not None}

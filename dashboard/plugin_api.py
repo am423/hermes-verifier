@@ -158,6 +158,12 @@ def _state_payload() -> Dict[str, Any]:
         "immunity_turns": int(settings.get("immunity_turns", 3)),
         "max_delta_chars": int(settings.get("max_delta_chars", 20000)),
         "blocker_steer": bool(settings.get("blocker_steer", True)),
+        # Advisor-mode controls (must mirror /verify status and plugin.yaml).
+        "advisor_tools": bool(settings.get("advisor_tools", False)),
+        "default_tools": list(settings.get("default_tools") or []),
+        "max_reviews_per_session": int(settings.get("max_reviews_per_session", 0) or 0),
+        "advisor_max_tokens": int(settings.get("advisor_max_tokens", 0) or 0),
+        "nudge_first_turns": int(settings.get("nudge_first_turns", 0) or 0),
     }
     payload["primary"] = _primary_model()
     payload["transcript"] = _transcript_from_disk(None, 60)
