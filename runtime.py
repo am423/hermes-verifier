@@ -257,15 +257,21 @@ def _sync_roster(state: SessionVerifier) -> None:
     signature = [(str(e.get("slug") or e.get("name")), bool(e.get("enabled", True)),
                   str(e.get("model") or ""), tuple(e.get("tools") or []),
                   str(e.get("instructions") or "")) for e in roster]
-    if signature != state.roster_signature:
-        state.roster_signature = signature
-        state.ensure_verifiers(roster)
-        return
-    # Same roster shape, but default_tools / advisor_tools may still have moved.
-    default_grant = _config(_CTX, "default_tools", []) or []
-    resolved = tools_mod.resolve_grant(default_grant)
-    if resolved != state.verifiers[DEFAULT_VERIFIER].tool_grant:
-        state.verifiers[DEFAULT_VERIFIER].tool_grant = resolved
+    # ensure_verifiers inserts and deletes keys in state.verifiers. Readers
+    # (snapshot, the review thread, the gate) iterate that dict, and doing it
+    # unlocked raises "dictionary changed size during iteration" -- which killed
+    # a review mid-flight and 500'd the dashboard. _LOCK is reentrant, so taking
+    # it here is safe even if a callee also takes it.
+    with _LOCK:
+        if signature != state.roster_signature:
+            state.roster_signature = signature
+            state.ensure_verifiers(roster)
+            return
+        # Same roster shape, but default_tools / advisor_tools may still have moved.
+        default_grant = _config(_CTX, "default_tools", []) or []
+        resolved = tools_mod.resolve_grant(default_grant)
+        if resolved != state.verifiers[DEFAULT_VERIFIER].tool_grant:
+            state.verifiers[DEFAULT_VERIFIER].tool_grant = resolved
 
 
 def bind_ctx(ctx: Any) -> None:
@@ -731,7 +737,13 @@ def _run_review(state: SessionVerifier, delta_text: str,
                     logger.debug("gate skipped %s (%s)", state.session_id,
                                  decision.source)
                     return
-                for verifier in state.enabled_verifiers():
+                # Snapshot under the lock: _review_one does I/O per verifier, so
+                # holding the lock across the loop would serialise every live
+                # session behind one review, but iterating the live dict would
+                # race _sync_roster.
+                with _LOCK:
+                    verifiers = list(state.enabled_verifiers())
+                for verifier in verifiers:
                     _review_one(state, verifier, delta_text,
                                 effort=decision.tier, origin_turn=origin_turn)
             finally:
@@ -761,8 +773,10 @@ def _gate_decision(state: SessionVerifier, delta_text: str) -> "gate_mod.GateDec
         return _GATE_FN_OVERRIDE(state, delta_text)
     if not _config(_CTX, "gate_enabled", False):
         return gate_mod.GateDecision(engage=True, effort="deep", source="disabled")
-    provider, model = _resolve_model_for(_CTX, state.enabled_verifiers()[0]) \
-        if state.enabled_verifiers() else (None, None)
+    with _LOCK:
+        active = list(state.enabled_verifiers())
+    provider, model = (_resolve_model_for(_CTX, active[0])
+                       if active else (None, None))
     try:
         return gate_mod.decide(
             _CTX,
