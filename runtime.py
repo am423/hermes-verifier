@@ -84,6 +84,11 @@ _INFLIGHT = threading.BoundedSemaphore(_MAX_INFLIGHT)
 # How many undelivered findings a verifier may queue. Two review cycles can
 # finish between two primary turns (_MAX_INFLIGHT is 2), and a single slot let
 # the second accepted finding silently overwrite the first.
+# Total characters of accumulated tool evidence handed back to the reviewer.
+# Each individual result is already capped; this bounds the SUM so a chain of
+# verifications cannot inflate the review prompt without limit.
+_MAX_EVIDENCE_CHARS = 6000
+
 _MAX_PENDING = 5
 
 # Under this, a review response is truncated mid-JSON and the whole review is
@@ -248,10 +253,26 @@ def _get_state(session_id: Any, create: bool = True) -> Optional[SessionVerifier
     key = _session_key(session_id)
     with _LOCK:
         state = _SESSIONS.get(key)
-        if state is None and create:
+        if state is not None:
+            # Touch so the dict's order tracks last USE rather than creation
+            # order. Plain insertion order made eviction FIFO, which discarded
+            # the oldest-created session -- typically the long-lived main one.
+            _SESSIONS.pop(key)
+            _SESSIONS[key] = state
+            return state
+        if create:
             if len(_SESSIONS) >= _MAX_SESSIONS:
-                oldest = next(iter(_SESSIONS))
-                _SESSIONS.pop(oldest, None)
+                # Prefer a session with nothing in flight: evicting one mid-review
+                # discards its pending findings, its dedupe history (so suppressed
+                # restatements re-raise) and its reviews_used counter, which IS
+                # the max_reviews_per_session cost cap.
+                # pending lives on each VERIFIER, not on the session.
+                idle = [k for k, st in _SESSIONS.items()
+                        if not st.reviewing and not st.backlog
+                        and not any(v.pending for v in st.verifiers.values())]
+                victim = idle[0] if idle else next(iter(_SESSIONS))
+                logger.info("evicting session %s (idle=%s)", victim, bool(idle))
+                _SESSIONS.pop(victim, None)
             state = SessionVerifier(session_id=key)
             state.ensure_verifiers(discover_roster())
             _SESSIONS[key] = state
@@ -585,6 +606,13 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
         attempts = tools_mod.MAX_TOOL_CALLS + 2 if grant else 1
         dispatches = 0
         refused_tool_call = False
+        # Verification results accumulate. The follow-up transcript used to be
+        # rebuilt as delta + ONLY the latest result, so a second verification
+        # silently discarded the first and the advisor reviewed on partial
+        # evidence. Bounded here so the transcript cannot grow past the point
+        # where the review costs more than it is worth.
+        evidence: List[str] = []
+        evidence_chars = 0
         for _attempt in range(attempts):
             result = _call_structured(
                 ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
@@ -630,8 +658,11 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
             # straight to the model, and tool grants are on by default here.
             output = delta_mod.redact(str(tools_mod.dispatch(ctx, call)))
             output = output[:delta_mod._TOOL_RESULT_CAP]
+            if evidence_chars + len(output) <= _MAX_EVIDENCE_CHARS:
+                evidence.append(f"Tool result from {call['tool']}:\n{output}")
+                evidence_chars += len(output)
             transcript = (
-                f"{delta_text}\n\n---\nTool result from {call['tool']}:\n{output}\n"
+                f"{delta_text}\n\n---\n" + "\n\n".join(evidence) + "\n"
                 "Now give your final review envelope (severity/finding/reasoning)."
             )
     except Exception as exc:
@@ -874,7 +905,19 @@ def _schedule_review(state: SessionVerifier, delta_text: str,
     )
     with _THREADS_LOCK:
         _ACTIVE_REVIEWS.add(thread)
-    thread.start()
+    try:
+        thread.start()
+    except RuntimeError as exc:
+        # Thread limits (EAGAIN, "can't start new thread") mean no thread body
+        # will ever run, so nothing will release the backlog slot or the registry
+        # entry that were just allocated for it. Same leak class as the early
+        # returns in _run_review, on a path with no thread to clean up after.
+        logger.warning("could not start a review thread for %s: %s",
+                       state.session_id, exc)
+        with _LOCK:
+            state.backlog = max(0, state.backlog - 1)
+        with _THREADS_LOCK:
+            _ACTIVE_REVIEWS.discard(thread)
 
 
 def drain_reviews(timeout: float = _DRAIN_TIMEOUT) -> bool:
@@ -973,7 +1016,11 @@ def ask_verifier(session_id: Any, question: str) -> Dict[str, Any]:
             "ts": time.time(), "session_id": state.session_id,
             "verifier": verifier.slug, "kind": "ask",
             "question": question[:1000],
-            "answer": getattr(result, "text", "")[:4000],
+            # (or "") because a None text is reachable: it is the same empty
+            # -completion shape the review path retries on. Slicing None raised
+            # TypeError straight out of the API handler -- a 500 with no answer
+            # and no row written.
+            "answer": (getattr(result, "text", "") or "")[:4000],
             "usage": {
                 "input_tokens": getattr(usage, "input_tokens", 0),
                 "output_tokens": getattr(usage, "output_tokens", 0),
@@ -1002,6 +1049,12 @@ def handle_post_llm_call(
 ) -> None:
     """Primary turn ended: extract the delta and schedule a review."""
     global _RECENT_SESSION
+    # Record the session BEFORE the enablement gate. The shipped default is
+    # enabled: false, and /verify on bootstraps from _RECENT_SESSION -- which was
+    # only ever set after that gate, so on a fresh install nothing was recorded
+    # and the documented toggle answered "No active session seen yet".
+    with _LOCK:
+        _RECENT_SESSION = _session_key(session_id)
     if not subsystem_enabled(session_id):
         return
     try:
@@ -1009,8 +1062,6 @@ def handle_post_llm_call(
         state = _get_state(session_id)
         if state is None:  # pragma: no cover - create=True above
             return
-        with _LOCK:
-            _RECENT_SESSION = state.session_id
         _sync_roster(state)
         max_chars = int(_config(_CTX, "max_delta_chars", 20000) or 20000)
         new_cursor, delta_text = delta_mod.extract_delta(
@@ -1275,9 +1326,27 @@ def snapshot() -> Dict[str, Any]:
             "events": list(EVENT_LOG[-100:]), "last_event_seq": last_event_seq()}
 
 
+def _prune_overrides() -> None:
+    """Keep _RUNTIME_OVERRIDES bounded.
+
+    Sessions are capped at _MAX_SESSIONS, but this map was not: every /verify
+    on|off and every Verifier Mode designation added an entry that was never
+    reclaimed, so a long-lived gateway accumulated one per session id it had
+    ever seen.
+    """
+    designated = _VERIFIER_SESSION
+    live = set(_SESSIONS)
+    stale = [k for k in _RUNTIME_OVERRIDES
+             if k not in live and k != designated]
+    for key in stale[: max(1, len(_RUNTIME_OVERRIDES) - _MAX_SESSIONS)]:
+        _RUNTIME_OVERRIDES.pop(key, None)
+
+
 def set_session_override(session_id: Any, enabled: bool) -> None:
     with _LOCK:
         _RUNTIME_OVERRIDES[_session_key(session_id)] = enabled
+        if len(_RUNTIME_OVERRIDES) > _MAX_SESSIONS * 4:
+            _prune_overrides()
 
 
 def clear_session_override(session_id: Any) -> None:

@@ -100,3 +100,38 @@ def test_a_clean_review_makes_no_extra_calls(ctx, monkeypatch):  # noqa: F811
     _arm(ctx, [ENVELOPE])
     _turn(ctx)
     assert len(_tool_calls(ctx)) == 1
+
+
+def test_every_verification_result_is_kept_not_just_the_last(ctx, monkeypatch):  # noqa: F811
+    """The follow-up transcript was REBUILT each iteration as
+    `delta + latest tool result`, so after two calls the advisor saw only the
+    second piece of evidence and reviewed on partial information.
+    """
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["advisor_tools"] = True
+    ctx.config["default_tools"] = ["read_file"]
+
+    calls = {'n': 0}
+
+    def _complete(**kwargs):
+        ctx.llm.calls.append(kwargs)
+        if "TOOL_CALL" not in kwargs.get("system_prompt", ""):
+            return FakeResult({"severity": "none", "finding": "", "reasoning": ""})
+        calls['n'] += 1
+        if calls['n'] <= 2:
+            return FakeResult(None, text='TOOL_CALL: read_file {"path": "a.py"}')
+        return ENVELOPE
+
+    ctx.llm.complete_structured = _complete
+    ctx.dispatch_tool = lambda name, args: f"EVIDENCE_{args['path']}"
+
+    _turn(ctx)
+
+    prompts = [c["input"][0]["text"] for c in _tool_calls(ctx)]
+    final = prompts[-1]
+    assert "EVIDENCE_a.py" in final
+    # The second read is the one that would have wiped the first.
+    assert final.count("EVIDENCE_") >= 2, (
+        "only the most recent tool result survived; the advisor is reviewing "
+        "with partial evidence"
+    )
