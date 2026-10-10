@@ -906,3 +906,33 @@ def test_identical_consecutive_turns_do_not_review(ctx, monkeypatch):
     # Replay the identical history with no assistant response: no new rows.
     _turn(ctx, history=hist, response="")
     assert len(ctx.llm.calls) == first, "no new delta → no second review"
+
+
+def test_review_exception_never_propagates(ctx, monkeypatch):
+    """A failing review must be contained: the primary agent is unaffected."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.raise_error = RuntimeError("provider exploded")
+
+    # Must not raise.
+    _turn(ctx)
+
+    state = runtime._get_state("s1", create=False)
+    assert state.consecutive_failures >= 1, "the failure must be recorded"
+    assert state.last_error, "the failure must be surfaced, not swallowed silently"
+
+
+def test_failure_streak_releases_backlog_wait(ctx, monkeypatch):
+    """A broken advisor must never stall the primary turn."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.raise_error = RuntimeError("down")
+    for i in range(4):
+        _turn(ctx, history=[{"role": "user", "content": f"t{i}"}], response=f"a{i}")
+    state = runtime._get_state("s1", create=False)
+    assert state.consecutive_failures >= 3
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(runtime.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + s))
+    runtime._backlog_wait(state, 1)
+    assert clock["t"] == 0, "a failing verifier must never stall the session"
