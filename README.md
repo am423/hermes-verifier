@@ -168,6 +168,15 @@ All four milestones are implemented: verifier runtime, backend API, Verifier Mod
 and roster/briefs. The desktop half ships opt-in — enable it in Settings → Plugins
 after a gateway restart.
 
+### Confirming the advisor is engaging
+
+`/verify status` reports an `engagement:` line with the review count and the
+empty-response count for this session. A non-zero review count means the advisor
+actually ran. `empty response(s)` counts provider completions that returned no
+payload — those are retried once, then surfaced in `last_error`. A rising empty
+count with a flat review count means the advisor model is not answering, not that
+it found nothing.
+
 ## License
 
 MIT
