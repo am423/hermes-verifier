@@ -227,6 +227,30 @@ def _slugify(name: str) -> str:
     return slug or "verifier"
 
 
+def _tools_list(raw: object, name: str) -> List[str]:
+    """Normalize a roster entry's ``tools`` value to a list of names.
+
+    Only a list or tuple is iterable-as-intended. Everything else used to be
+    either fatal or silently wrong:
+
+    * ``tools: 7`` raised TypeError out of a function whose docstring promises
+      "Never raises", and that escape reached discover_roster -> [], which
+      _sync_roster fed to ensure_verifiers([]), DELETING every live verifier and
+      its pending findings.
+    * ``tools: read_file`` iterated the STRING into single characters, so the
+      entry silently ended up with no usable tools.
+
+    A malformed value now degrades to "no tools" with a warning.
+    """
+    if isinstance(raw, (list, tuple)):
+        return [str(t) for t in raw if isinstance(t, str)]
+    if raw is not None:
+        logger.warning(
+            "VERIFIER.yml entry %r has a non-list 'tools' (%s); ignoring it",
+            name, type(raw).__name__)
+    return []
+
+
 def _parse_roster_file(text: str) -> List[Dict[str, object]]:
     """Parse one VERIFIER.yml into roster entries. Never raises.
 
@@ -261,7 +285,7 @@ def _parse_roster_file(text: str) -> List[Dict[str, object]]:
             "slug": _slugify(name),
             "enabled": bool(item.get("enabled", True)),
             "model": str(item.get("model") or "").strip(),
-            "tools": [str(t) for t in item.get("tools") or [] if isinstance(t, str)],
+            "tools": _tools_list(item.get("tools"), name),
             "instructions": str(item.get("instructions") or "").strip(),
         }
         if isinstance(shared, str) and shared.strip():

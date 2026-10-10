@@ -258,7 +258,17 @@ async def mark_verifier_session(body: dict) -> JSONResponse:
     runtime = _runtime()
     if runtime is None:
         return JSONResponse(status_code=503, content={"ok": False, "error": "verifier backend not loaded"})
-    runtime.mark_verifier_session(session_id)
+    result = runtime.mark_verifier_session(session_id)
+    persisted = result.get("persisted") if isinstance(result, dict) else True
+    if not persisted:
+        # Report the failure instead of claiming a durable designation. The
+        # value is live for this process but will NOT survive a restart, and the
+        # UI would otherwise show it as saved.
+        return JSONResponse(
+            status_code=200,
+            content={"ok": False, "session_id": session_id,
+                     "error": "designation applied for this session but could not "
+                              "be persisted; it will not survive a restart"})
     return JSONResponse(content={"ok": True, "session_id": session_id})
 
 

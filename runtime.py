@@ -94,6 +94,10 @@ _MAX_PENDING = 5
 
 # Under this, a review response is truncated mid-JSON and the whole review is
 # lost, so it is a FLOOR: a smaller configured cap is clamped up, never dropped.
+# Below this, the delta carries too little for a review to mean anything, so the
+# cost is spent for nothing. A configured max_delta_chars under it is raised to it.
+_MIN_DELTA_CHARS = 500
+
 _MIN_ADVISOR_TOKENS = 1024
 
 _BACKLOG_WAIT_CAP = 30.0
@@ -166,6 +170,11 @@ class Verifier:
     # Undelivered findings, oldest first. A QUEUE, not a slot: concurrent
     # review cycles can each accept a finding before the next primary turn.
     pending: List[Dict[str, Any]] = field(default_factory=list)
+    # Consecutive failures for THIS verifier. The session-level counter is reset
+    # by any verifier's success, so in a mixed roster a permanently broken entry
+    # never reached the failure streak that releases _backlog_wait's waiters --
+    # it kept costing the full cap on every turn.
+    consecutive_failures: int = 0
     stats: Dict[str, Any] = field(
         default_factory=lambda: {
             "reviews": 0, "findings": 0, "blockers": 0, "cautions": 0,
@@ -494,6 +503,11 @@ def _record_and_deliver(state: SessionVerifier, verifier: Verifier,
                         usage: Any, delta_excerpt: str = "",
                         prompt_parts: Optional[Dict[str, Any]] = None,
                         origin_turn: int = 0) -> None:
+    # Reached only with a well-formed envelope: this is what "healthy" means.
+    with _LOCK:
+        state.consecutive_failures = 0
+    verifier.consecutive_failures = 0
+    state.last_error = ""
     severity = str(parsed.get("severity") or "none").strip().lower()
     finding_text = str(parsed.get("finding") or "").strip()
     reasoning = str(parsed.get("reasoning") or "").strip()
@@ -578,6 +592,18 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
     holds per-CYCLE state. Without this lock they interleave on it and a
     distinct finding is dropped as rate_limited.
     """
+    # One delta runs EVERY enabled verifier, so counting deltas made a cap of N
+    # really N x verifiers. Counting the review itself is what the setting
+    # promises ("hard cap on advisor reviews per session") and what cost control
+    # needs. Incremented before the call so a review that fails still consumes
+    # budget: that is what makes it a control rather than a suggestion.
+    cap = safe_int(_config(_CTX, "max_reviews_per_session", 0))
+    with _LOCK:
+        if cap and state.reviews_used >= cap:
+            logger.debug("review budget exhausted for %s (%d)",
+                         state.session_id, cap)
+            return
+        state.reviews_used += 1
     with verifier.review_lock:
         return _review_one_serial(state, verifier, delta_text,
                                   effort=effort, origin_turn=origin_turn)
@@ -720,14 +746,17 @@ def _review_one_serial(state: SessionVerifier, verifier: Verifier, delta_text: s
             hint = str(exc)
         state.last_error = f"{cls}: {hint}"[:300]
         state.consecutive_failures += 1
+        verifier.consecutive_failures += 1
         publish_event("error", {"session_id": state.session_id,
                                 "verifier": verifier.slug, "error": state.last_error})
         logger.warning("verifier %s review failed for %s: %s",
                        verifier.slug, state.session_id, hint)
         return
 
-    state.consecutive_failures = 0
-    state.last_error = ""
+    # NOTE: the success reset deliberately does NOT happen here. It used to, so a
+    # malformed or empty response -- which is a failure -- cleared the streak
+    # before the validation below ran, and _backlog_wait's failure escape could
+    # never recognise a verifier that persistently returned garbage.
     # The review's TOTAL, across every completion it made.
     usage = (types.SimpleNamespace(input_tokens=billed_in, output_tokens=billed_out,
                                    cost_usd=billed_cost or None)
@@ -771,6 +800,9 @@ def _review_one_serial(state: SessionVerifier, verifier: Verifier, delta_text: s
                                     "error": state.last_error})
             logger.warning("verifier %s returned unparseable output for %s (%d chars)",
                            verifier.slug, state.session_id, text_len)
+            with _LOCK:
+                state.consecutive_failures += 1
+            verifier.consecutive_failures += 1
         else:
             with _LOCK:
                 state.last_error = (
@@ -782,6 +814,9 @@ def _review_one_serial(state: SessionVerifier, verifier: Verifier, delta_text: s
                                     "error": state.last_error})
             logger.warning("verifier %s still empty after retry for %s",
                            verifier.slug, state.session_id)
+            with _LOCK:
+                state.consecutive_failures += 1
+            verifier.consecutive_failures += 1
         return
     severity = str(parsed.get("severity") or "none").strip().lower()
     finding_text = str(parsed.get("finding") or "").strip()
@@ -958,14 +993,14 @@ def _schedule_review(state: SessionVerifier, delta_text: str,
                      origin_turn: int = 0) -> None:
     # Claude Code caps advisor calls per request (max_uses); OMP has no cap at
     # all, so a noisy roster silently runs up bill. This is the session-scoped
-    # version. The counter increments before dispatch, so a review that fails
-    # still consumes budget — that is what makes it a cost control.
-    cap = int(_config(_CTX, "max_reviews_per_session", 0) or 0)
+    # version. The CAP is enforced per actual review in _review_one; this is
+    # only a cheap early exit so an exhausted session does not even pay for the
+    # gate call. It deliberately does not increment: a gate skip is not a review.
+    cap = safe_int(_config(_CTX, "max_reviews_per_session", 0))
     with _LOCK:
         if cap and state.reviews_used >= cap:
             logger.debug("review budget exhausted for %s (%d)", state.session_id, cap)
             return
-        state.reviews_used += 1
     if _REVIEW_FN_OVERRIDE is not None:
         _REVIEW_FN_OVERRIDE(state, delta_text, origin_turn)
         return
@@ -1046,7 +1081,12 @@ def _backlog_wait(state: SessionVerifier, threshold: Optional[int]) -> None:
     while time.monotonic() < deadline:
         with _LOCK:
             backlog = state.backlog
-            failing = state.consecutive_failures >= 3
+            # Any verifier in a failure streak releases waiters. The session
+            # counter alone missed the mixed-roster case: a healthy entry reset it
+            # while a broken one kept costing the full cap every turn.
+            failing = (state.consecutive_failures >= 3
+                       or any(v.consecutive_failures >= 3
+                              for v in state.verifiers.values()))
         if backlog < threshold or failing:
             return
         time.sleep(_BACKLOG_POLL)
@@ -1135,7 +1175,11 @@ def handle_post_llm_call(
         if state is None:  # pragma: no cover - create=True above
             return
         _sync_roster(state)
-        max_chars = int(_config(_CTX, "max_delta_chars", 20000) or 20000)
+        # safe_int, not `or 20000`: an explicit value is the operator's choice.
+        # Floored rather than defaulted, because a delta of a few characters
+        # gives the reviewer nothing to work with and bills for the privilege.
+        max_chars = max(_MIN_DELTA_CHARS,
+                        safe_int(_config(_CTX, "max_delta_chars", 20000), 20000))
         new_cursor, delta_text = delta_mod.extract_delta(
             cursor_len=state.cursor_len,
             conversation_history=history,
@@ -1213,8 +1257,10 @@ def handle_pre_llm_call(session_id: Any = "", **kwargs: Any) -> Optional[Dict[st
         # Only arm the cooldown when it is not already running. Re-arming on
         # every delivery would make a recurring blocker permanently immune,
         # because each delivery reset the counter before it could count down.
+        # safe_int, not `or 3`: an explicit immunity_turns: 0 means "no cooldown"
+        # and the `or` idiom silently rewrote it to 3.
         state.immunity_left = max(state.immunity_left,
-                                  int(_config(_CTX, "immunity_turns", 3) or 3))
+                                  safe_int(_config(_CTX, "immunity_turns", 3), 3))
     else:
         state.immunity_left = max(0, state.immunity_left - 1)
     blocks = [_render_finding(slug, finding)
@@ -1260,7 +1306,7 @@ def handle_pre_verify(session_id: Any = "", **kwargs: Any) -> Optional[Dict[str,
             if blocker_verifier is not None:
                 blocker_verifier.pending.insert(0, blocker)   # keep it oldest-first
             return None
-        state.immunity_left = int(_config(_CTX, "immunity_turns", 3) or 3)
+        state.immunity_left = safe_int(_config(_CTX, "immunity_turns", 3), 3)
     text = str(blocker.get("finding", "")).strip()
     return {
         "action": "continue",
@@ -1325,13 +1371,19 @@ def mark_verifier_session(session_id: Any) -> str:
         _VERIFIER_SESSION = key
         _RECENT_SESSION = key
         _RUNTIME_OVERRIDES[key] = True
+    persisted = False
     if _CTX is not None:
         try:
             _CTX.set_config("verifier_session", key)
+            persisted = True
         except Exception as exc:
+            # Not just a warning: the docstring promises this survives a restart,
+            # and the API answered ok:true regardless, so the UI reported a
+            # durable designation that would vanish on the next launch.
             logger.warning("ctx.set_config('verifier_session') failed: %s", exc)
-    publish_event("status", {"session_id": key, "enabled": True, "designated": True})
-    return key
+    publish_event("status", {"session_id": key, "enabled": True,
+                             "designated": True, "persisted": persisted})
+    return {"session_id": key, "persisted": persisted}
 
 
 def designated_session() -> Optional[str]:
