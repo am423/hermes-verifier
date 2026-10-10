@@ -100,3 +100,32 @@ Goal: a real session screen with the verifier attached.
 | 2 | `ctx.llm` exact surface (model override, streaming) needs a spike against the running gateway | **Resolved** — `ctx.llm.complete_structured(…, json_schema=…)` with trust-gated `model=`/`provider=` overrides (`plugins.entries.<id>.llm.allow_model_override`) |
 | 3 | Desktop transcript fidelity: matching the native session screen look is component-by-component; core session components may not be exported to the SDK | M3 |
 | 4 | Secret redaction parity: verifier must never see raw secrets that the primary's transcript already obfuscates | M1 ships a regex scrubber + long-token collapse; parity with the host obfuscator is a hardening item |
+
+## M5 — Advisor-mode upgrade (best of Claude Code + OMP)
+
+- [x] Declare new settings: `advisor_tools`, `default_tools`,
+      `max_reviews_per_session`, `advisor_max_tokens`, `nudge_first_turns`
+- [x] **Fix `sync_backlog`** — the `.isdigit()` call crashed on an int setting,
+      was swallowed by the handler's broad except, and silently dropped that
+      turn's finding. Now normalized via `_parse_sync_backlog`.
+- [x] **Advisor tools** (`advisor_tools.py`) — a read-only allowlist
+      (`read_file`, `search_files`) with a `TOOL_CALL:` line protocol, dispatched
+      through `ctx.dispatch_tool` so host approval/redaction/budget still apply.
+      Grants are per verifier (roster `tools:` or `default_tools`).
+- [x] **Review budget** — `max_reviews_per_session` (Claude Code's `max_uses`,
+      session-scoped). Counts attempts, not successes, so failures still cost.
+- [x] **Advisory output cap** — `advisor_max_tokens` forwarded to the provider.
+- [x] **First-turn nudge** — `nudge_first_turns`, injected via `pre_llm_call`
+      (cache-safe). Off by default; carries Claude Code's measured caveat
+      (+7pp Haiku, neutral Sonnet, slightly negative Opus).
+- [x] `/verify status` surfaces budget, tool grant, and nudge state.
+- [x] Tests: 43 → 84.
+
+### Deliberately out of scope
+
+- Claude Code's server-side `advisor_20260301` tool (encrypted
+  `advisor_redacted_result`, `pause_turn` resumption, `max_uses` per request) is
+  an Anthropic server-side primitive with no Hermes equivalent hook.
+- Model-pairing rank tables ("advisor must rank ≥ main model") need a capability
+  ranking Hermes does not expose.
+- OMP's `tier.advisor` service tiers have no Hermes surface.

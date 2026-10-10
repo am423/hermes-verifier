@@ -30,6 +30,80 @@ the primary agent runs off a cliff.
   selector (the composer's own model catalog) while that session is focused,
   and a Findings pane shows the verifier's live activity.
 
+## What's new vs Claude Code and OMP
+
+This plugin implements the **advisor pattern** — a second, independent model that
+reviews the primary agent's work mid-task. It takes the best of both reference
+implementations:
+
+| Capability | Claude Code advisor | OMP advisor | Hermes Verifier |
+| --- | --- | --- | --- |
+| Advisor tools (verify claims, not prose) | — | `read`/`grep`/`glob` | **Yes** — `read_file`, `search_files` via a read-only allowlist |
+| Per-session review budget | `max_uses` (per request) | — | **Yes** — `max_reviews_per_session` |
+| Advisory output cap | `max_tokens` | — | **Yes** — `advisor_max_tokens` |
+| Multi-advisor roster | — | `WATCHDOG.yml` | **Yes** — `VERIFIER.yml`, per-advisor model |
+| Project review guidance | — | `WATCHDOG.md` | **Yes** — `VERIFIER.md` |
+| First-turn consultation nudge | Yes (+7pp on Haiku-class) | — | **Yes** — `nudge_first_turns`, off by default |
+| Catch-up pacing | — | `syncBacklog` | **Yes** — `sync_backlog` |
+| Immunity / rate limit | — | `immuneTurns` | **Yes** — `immunity_turns` |
+| Cost + token transparency | `/usage` | `/advisor status` | **Yes** — `/verify status` |
+
+**Neither** Claude Code nor OMP ships a session-level review budget: Claude Code
+caps per request, OMP does not cap at all, so a noisy roster silently runs up
+bill. `max_reviews_per_session` is the honest session-scoped version, and it
+counts *attempts* rather than successes, so a failing review still consumes
+budget — that is what makes it a cost control.
+
+### The nudge caveat
+
+Claude Code measured the turn-2 consultation reminder at **+7 percentage points
+on Haiku-class executors, no measurable effect on Sonnet, and slightly lower
+pass rates on Opus**. It is therefore off by default. Enable it deliberately,
+and not on a strong main model.
+
+## Advisor tools and their limits
+
+With `advisor_tools: true`, an advisor whose roster entry (or `default_tools`)
+grants a tool may **verify a claim instead of reviewing prose** — reading the
+file the primary agent just edited, or grepping for the API it called. That is
+OMP's core advantage and the main reason an advisor beats a same-model
+rubber-stamp review.
+
+The grant is deliberately narrow:
+
+- Only `read_file` and `search_files` are allowlisted. `terminal`, `write_file`,
+  and `patch` are refused, so a mistyped or over-broad roster entry cannot
+  widen the advisor's reach.
+- Dispatch goes through `ctx.dispatch_tool`, so the host's approval, redaction,
+  and result-budget pipelines still apply exactly as they would for a
+  model-initiated call.
+- At most 3 tool calls per review, each result truncated to 6000 characters.
+- Grants are **per verifier**: only an advisor that was granted a tool is told
+  tools exist, and only it can call one.
+
+> **Privacy:** a tool-granted advisor reads files your session can read, and
+> those reads go to the advisor model's provider. That is the same tradeoff OMP
+> makes, and the reason the feature ships off by default.
+
+## Configuration
+
+Settings live under `plugins.entries.hermes-verifier.settings`. Every new
+capability is **off by default**, so the zero-config behavior is unchanged.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `enabled` | `false` | Run the verifier after every primary turn. |
+| `verifier_model` | `""` | Advisor model as `provider/model`; empty = the session's primary model. |
+| `advisor_tools` | `false` | Let granted advisors verify claims with read-only tools. |
+| `default_tools` | `[]` | Read-only tools for the default verifier. Non-allowlisted names are refused. |
+| `max_reviews_per_session` | `0` | Hard cap on reviews per session; `0` = unlimited. |
+| `advisor_max_tokens` | `0` | Cap advisor output per review; `0` = provider default, minimum `1024` when set. |
+| `nudge_first_turns` | `0` | Inject a consultation reminder into the first N turns. See the caveat above. |
+| `sync_backlog` | `"off"` | Catch-up pacing when the advisor falls behind: `off`/`1`/`3`/`5`. |
+| `immunity_turns` | `3` | Turns after an interrupting finding before another may interrupt. |
+| `max_delta_chars` | `20000` | Cap on the rendered transcript delta sent to the advisor. |
+| `blocker_steer` | `true` | Let a blocker keep a coding turn alive via the pre-verify gate. |
+
 ## Repository layout (the repo root IS the installable package)
 
 ```
@@ -37,6 +111,7 @@ hermes-verifier/               ← install root (~/.hermes/plugins/hermes-verifi
 ├── plugin.yaml                ← manifest: 4 hooks, llm.model_override capability, schema
 ├── __init__.py                ← register(ctx)
 ├── brief.py                   ← VERIFIER.md / VERIFIER.yml discovery, @imports, prompts
+├── advisor_tools.py           ← read-only tool grant: allowlist, TOOL_CALL protocol, dispatch
 ├── delta.py                   ← transcript delta extraction + redaction + finding-strip
 ├── guard.py                   ← emission guard (normalize, phrase filter, dedupe, rate limit)
 ├── runtime.py                 ← per-session verifier runtime, delivery, roster, events
@@ -47,7 +122,8 @@ hermes-verifier/               ← install root (~/.hermes/plugins/hermes-verifi
 ├── desktop/
 │   └── plugin.js              ← Verifier Mode page (route /verifier)
 ├── skills/hermes-verifier/SKILL.md
-├── tests/                     ← 41 tests: guard, delta, runtime, roster, backlog, events
+├── tests/                     ← 84 tests: guard, delta, runtime, roster, backlog,
+│                                budget, nudge, advisor tools, events
 ├── pytest.ini                 ← importlib mode: keeps pytest off the hyphenated root package
 ├── docs/design.md             ← full architecture and behavior spec
 └── PLAN.md                    ← milestone checklist
