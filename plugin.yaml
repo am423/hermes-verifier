@@ -76,11 +76,3 @@ config_schema:
     type: int
     default: 0
     description: "Inject a consultation reminder into the first N turns of a session. Claude Code found +7pp on Haiku-class executors, neutral on Sonnet, slightly negative on Opus. 0 = off."
-  semantic_dedupe_threshold:
-    type: float
-    default: 0.0
-    description: "Suppress a RESTATED finding when cosine similarity to a recent finding is at least this. 0 = off (SHIPPED DEFAULT -- do not enable without validating on your own findings). UNVALIDATED: the 0.30 figure was fit on unrelated negative pairs, but same-session findings share file names and identifiers and score 0.29-0.81, overlapping the paraphrase range 0.59-0.78. No threshold cleanly separates them, so enabling this WILL over-suppress distinct findings. Cosine is not a probability."
-  semantic_dedupe_url:
-    type: str
-    default: "http://127.0.0.1:8766/similarity"
-    description: "Local sentence-embedding endpoint (sidecar/embed_server.py). Empty disables the stage."
