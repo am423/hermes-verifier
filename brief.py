@@ -137,8 +137,13 @@ _IMPORT_LINE = re.compile(r"^@([^\s`\"'<>]+)\s*$")
 _FENCE = re.compile(r"^```|^~~~")
 
 
+# A brief file is prompt text, not data. Anything larger is a mistake, and
+# reading it would be paid for on every turn.
+_MAX_IMPORT_BYTES = 256 * 1024
+
+
 def expand_imports(text: str, base_dir: Path, seen: Optional[set] = None,
-                   depth: int = 0) -> str:
+                   depth: int = 0, entry: Optional[Path] = None) -> str:
     """Expand ``@path`` import lines, mirroring context-file import rules.
 
     Relative imports resolve from the importing file's directory, ``~/`` from
@@ -149,6 +154,16 @@ def expand_imports(text: str, base_dir: Path, seen: Optional[set] = None,
     if depth > 8:
         return text
     seen = seen if seen is not None else set()
+    if entry is not None:
+        # Seed with the file being expanded, INSIDE the function, so "cycles are
+        # skipped" holds however a caller invokes it. Seeding only at the call
+        # sites left the promise false for this entry point, and an A<->B cycle
+        # re-included A: B's `@A` did not find A in `seen`, because only A had
+        # been walked from the top, so A expanded a second time underneath B.
+        try:
+            seen.add(Path(entry).resolve())
+        except OSError:
+            seen.add(Path(entry))
     out: List[str] = []
     in_fence = False
     for line in text.splitlines():
@@ -171,6 +186,22 @@ def expand_imports(text: str, base_dir: Path, seen: Optional[set] = None,
             out.append(line)
             continue
         if target in seen:
+            out.append(line)
+            continue
+        try:
+            stat = target.stat()
+        except OSError:
+            out.append(line)  # missing import stays literal
+            continue
+        if not target.is_file():
+            # A FIFO, device or socket would BLOCK read_text() and stall roster
+            # discovery -- i.e. the session. Only regular files are imports.
+            logger.warning("@import %s is not a regular file; left literal", raw)
+            out.append(line)
+            continue
+        if stat.st_size > _MAX_IMPORT_BYTES:
+            logger.warning("@import %s is %d bytes (cap %d); left literal",
+                           raw, stat.st_size, _MAX_IMPORT_BYTES)
             out.append(line)
             continue
         try:
@@ -204,7 +235,7 @@ def load_brief_blocks(start_dir: Optional[Path] = None,
         text = _read_candidate(candidate)
         if text is None:
             continue
-        expanded = expand_imports(text, candidate.parent)
+        expanded = expand_imports(text, candidate.parent, entry=candidate)
         blocks.append(f"{ATTENTION_HEADER}\n{expanded}\n{ATTENTION_FOOTER}")
     return blocks
 
@@ -311,7 +342,7 @@ def load_roster(start_dir: Optional[Path] = None,
         text = _read_candidate(candidate)
         if text is None:
             continue
-        expanded = expand_imports(text, candidate.parent)
+        expanded = expand_imports(text, candidate.parent, entry=candidate)
         for entry in _parse_roster_file(expanded):
             slug = str(entry["slug"])
             merged[slug] = entry  # later (more specific) wins
