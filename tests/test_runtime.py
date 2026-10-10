@@ -1270,3 +1270,36 @@ def test_advisor_max_tokens_reaches_the_provider(ctx, monkeypatch):
     ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
     _turn(ctx, history=[{"role": "user", "content": "t3"}], response="a3")
     assert "max_tokens" not in ctx.llm.calls[-1]
+
+
+# ── findings in any script must survive normalization ───────────────────────
+
+@pytest.mark.parametrize("note", [
+    "検査の結果、この問題は深刻です",
+    "Проверь это перед деплоем",
+    "check 检查这个漏洞 before shipping",
+    "the write path bypasses the durable queue",
+])
+def test_a_finding_in_any_script_is_not_content_free(note):
+    """normalize() stripped every non-Latin character, so a non-English finding
+    normalized to "" and was dropped as content-free -- counted as
+    phrase_filtered, which looks like ordinary noise filtering."""
+    from verifier_pkg import guard
+    assert not guard.is_content_free(guard.normalize(note)), (
+        f"{note!r} normalizes to {guard.normalize(note)!r} and would be dropped"
+    )
+
+
+def test_two_different_cjk_findings_do_not_collapse_to_one():
+    """With the old pattern both normalized to "" (or to just their Latin part),
+    so the second was suppressed as a duplicate of the first."""
+    from verifier_pkg import guard
+    a = guard.normalize("检查写入路径")
+    b = guard.normalize("检查重试循环")
+    assert a and b and a != b
+
+
+def test_english_normalization_is_unchanged():
+    from verifier_pkg import guard
+    assert guard.normalize("The Write Path, Bypasses!! the queue") == \
+        "the write path bypasses the queue"

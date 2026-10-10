@@ -33,7 +33,13 @@ _PHRASES = {
     "no action needed", "seems fine", "seems good", "nothing of note",
 }
 
-_ALNUM_RUN = re.compile(r"[^0-9a-z]+")
+# Unicode-aware: \w keeps letters and digits from every script. The previous
+# [^0-9a-z] erased all non-Latin characters, so a finding written in Japanese or
+# Russian normalized to "" and was dropped as content-free -- silently, and
+# counted as phrase_filtered rather than as the bug it was. English findings, and
+# CJK findings that happened to contain a Latin word, were unaffected, which is
+# why it went unnoticed.
+_ALNUM_RUN = re.compile(r"[^\w]+")
 
 
 def normalize(note: str) -> str:
@@ -87,8 +93,11 @@ class EmissionGuard:
             self.stats["rate_limited"] += 1
             return False
 
-        # Record BEFORE the rate-limit decision so an escalation that loses the
-        # rate limit is still remembered at its new severity.
+        # Recorded AFTER the rate-limit decision, deliberately: a finding that
+        # loses the rate limit was never delivered, so it must stay eligible to
+        # re-deliver next cycle. Recording before the decision (as this comment
+        # used to claim) would mark it seen and dedupe it away permanently --
+        # an escalation would be silently swallowed.
         self._seen[normalized] = max(previous_rank or 0, new_rank)
         self._seen.move_to_end(normalized)
         while len(self._seen) > self._max_history:

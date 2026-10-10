@@ -90,30 +90,37 @@ def parse_tool_call(text: str, granted: List[str]) -> Optional[Dict[str, Any]]:
     """
     import json
 
+    # Scan for the first WELL-FORMED call, as the docstring says. Every branch
+    # used to `return None` instead, so a single malformed TOOL_CALL line made
+    # the whole review skip verification even when a valid call followed it --
+    # the helper looked like a strict validator but behaved like a quitter.
+    # Returning None now means "no usable call anywhere in the text".
     for line in (text or "").splitlines():
         stripped = line.strip()
         if not stripped.startswith(TOOL_CALL_PREFIX):
             continue
         body = stripped[len(TOOL_CALL_PREFIX):].strip()
         if not body:
-            return None
+            logger.warning("advisor emitted an empty TOOL_CALL line; skipping it")
+            continue
         name, _, raw_args = body.partition(" ")
         name = name.strip()
         if name not in granted:
             logger.warning("advisor requested non-granted tool: %s", name)
-            return None
+            continue
         try:
             args = json.loads(raw_args) if raw_args.strip() else {}
         except json.JSONDecodeError:
-            logger.warning("advisor tool call had malformed JSON args")
-            return None
+            logger.warning("advisor tool call had malformed JSON args; skipping it")
+            continue
         if not isinstance(args, dict):
-            return None
+            logger.warning("advisor tool call args were not an object; skipping it")
+            continue
         spec = ALLOWED_TOOLS[name]
         missing = [k for k in spec["required"] if k not in args]
         if missing:
             logger.warning("advisor tool call %s missing args: %s", name, missing)
-            return None
+            continue
         return {"tool": name, "args": args}
     return None
 

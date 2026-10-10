@@ -308,9 +308,14 @@ def _sync_roster(state: SessionVerifier) -> None:
     comparison of slugs plus one setting read), so it runs at every turn.
     """
     roster = discover_roster()
+    # shared_instructions is part of the signature: a VERIFIER.yml edit to the
+    # top-level `instructions:` block that left every other field alone was
+    # silently ignored, because ensure_verifiers only re-runs when this tuple
+    # changes.
     signature = [(str(e.get("slug") or e.get("name")), bool(e.get("enabled", True)),
                   str(e.get("model") or ""), tuple(e.get("tools") or []),
-                  str(e.get("instructions") or "")) for e in roster]
+                  str(e.get("instructions") or ""),
+                  str(e.get("shared_instructions") or "")) for e in roster]
     # ensure_verifiers inserts and deletes keys in state.verifiers. Readers
     # (snapshot, the review thread, the gate) iterate that dict, and doing it
     # unlocked raises "dictionary changed size during iteration" -- which killed
@@ -1308,6 +1313,17 @@ def handle_pre_verify(session_id: Any = "", **kwargs: Any) -> Optional[Dict[str,
             return None
         state.immunity_left = safe_int(_config(_CTX, "immunity_turns", 3), 3)
     text = str(blocker.get("finding", "")).strip()
+    # A steered blocker IS a delivery, and it was the one delivery path that
+    # published no finding_delivered event -- so blockers injected through the
+    # steer gate were invisible in the event log and in delivery accounting.
+    publish_event("finding_delivered", {
+        "session_id": state.session_id,
+        "verifier": blocker_verifier.slug if blocker_verifier is not None else "default",
+        "severity": "blocker",
+        "origin_turn": int(blocker.get("origin_turn") or 0),
+        "delivered_turn": state.turns_seen,
+        "via": "pre_verify_steer",
+    })
     return {
         "action": "continue",
         "message": (

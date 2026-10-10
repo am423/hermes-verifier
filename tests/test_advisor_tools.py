@@ -70,3 +70,36 @@ def test_dispatch_swallows_exceptions():
             raise RuntimeError("host refused")
 
     assert "failed" in advisor_tools.dispatch(Boom(), {"tool": "read_file", "args": {"path": "f"}})
+
+
+# ── parse_tool_call: the docstring says "first WELL-FORMED" ─────────────────
+
+def test_a_malformed_line_does_not_hide_a_valid_call_after_it():
+    """Every failure branch used to return None, so encountering one malformed
+    TOOL_CALL line skipped verification entirely even when a good call followed.
+    The helper described itself as finding the first well-formed call."""
+    text = (
+        'TOOL_CALL: read_file {not valid json at all}\n'
+        'TOOL_CALL: read_file {"path": "src/jobs/queue.py"}\n'
+    )
+    call = advisor_tools.parse_tool_call(text, ["read_file", "search_files"])
+    assert call == {"tool": "read_file", "args": {"path": "src/jobs/queue.py"}}
+
+
+def test_a_non_granted_tool_does_not_hide_a_granted_call():
+    text = ('TOOL_CALL: write_file {"path": "x"}\n'
+            'TOOL_CALL: read_file {"path": "y"}\n')
+    call = advisor_tools.parse_tool_call(text, ["read_file"])
+    assert call is not None and call["tool"] == "read_file"
+
+
+def test_no_usable_call_anywhere_returns_none():
+    text = 'TOOL_CALL: write_file {"path": "x"}\nTOOL_CALL: \n'
+    assert advisor_tools.parse_tool_call(text, ["read_file"]) is None
+
+
+def test_a_missing_required_arg_does_not_hide_a_later_good_call():
+    text = ('TOOL_CALL: read_file {}\n'
+            'TOOL_CALL: read_file {"path": "z.py"}\n')
+    call = advisor_tools.parse_tool_call(text, ["read_file"])
+    assert call is not None and call["args"] == {"path": "z.py"}
