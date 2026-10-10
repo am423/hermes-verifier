@@ -669,10 +669,25 @@ Both are wrong. Proof by session id, which shows *which process* wrote each row:
 **Every A/B session returned `severity: none`. The 838-token finding I cited was
 written by the desktop process running stale code — it was never part of the A/B.**
 
-So the comparison has **no data at all** — not "inconclusive (n=1)", which is
-what the subsequent correction claimed, but n=0. The 939→931 mean shift was
-computed over a mix of stale-process findings and was never an after-only
-comparison.
+**The finding-attribution was false (n=0 findings, not 1) — that citation is
+voided.** But "n=0 findings" is not "no data": output tokens WERE captured, and
+output length is exactly the metric the instruction targeted. Restricted to the
+`sev=none` population (the only comparable set), the arms are:
+
+| arm | n | output tokens | mean |
+| --- | --- | --- | --- |
+| baseline (sys=1671) | 3 | 78, 96, 58 | 77 |
+| instruction (sys=1903) | 3 | 75, 235, 66 | 125 |
+| after revert (sys=1794) | 2 | 42, 622 | 332 |
+
+So: **no distinguishable effect at n=3 per arm** — the ranges overlap heavily
+(58–96 vs 66–235), and the observed direction is opposite to the hypothesis, but
+one outlier per arm drives the means. The correct statement is "not
+distinguishable at this n", NOT "never measured" and NOT "no measurable
+effect". The prompt-instruction question stays OPEN.
+
+The 939→931 mean shift, by contrast, was computed over a mix of stale-process
+findings and was never an after-only comparison — that part is void.
 
 **Root cause of the misattribution:** the desktop process started at 12:23AM and
 held pre-change code for the whole window, while `hermes chat -q` sessions load
