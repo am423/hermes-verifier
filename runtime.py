@@ -558,11 +558,11 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
         "system_prompt": len(system_prompt),
         "instructions": len(brief.REVIEW_TASK),
         "transcript": len(transcript),
-        # Token estimate for budget tuning. 3.96 chars/token is MEASURED with
-        # tiktoken/cl100k_base on realistic max-size deltas — but tiktoken is a
-        # proxy, not the provider's tokenizer, so treat this as indicative only.
-        # The authoritative number is usage.input_tokens, in the same row.
-        "est_tokens": int((len(system_prompt) + len(transcript)) / 3.96),
+        # Token estimate for budget tuning. Measured, not modelled: across three
+        # live reviews the provider billed ~2.48x the tiktoken/cl100k_base count
+        # (ratios 2.46 / 2.39 / 2.59), i.e. ~1.60 chars per billed token on this
+        # content. The authoritative number is usage.input_tokens, in this row.
+        "est_tokens": int((len(system_prompt) + len(transcript)) / 1.60),
     }
     # Latest values for /verify status. Updated every review (not setdefault).
     verifier.stats["est_tokens"] = parts["est_tokens"]
