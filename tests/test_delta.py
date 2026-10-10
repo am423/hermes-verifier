@@ -132,3 +132,25 @@ def test_tool_call_args_are_truncated_tighter():
     assert rendered.count("code") < 40, (
         f"payload still dominates the row: {rendered.count('code')} repeats"
     )
+
+
+def test_tool_result_rows_are_capped_in_the_delta():
+    """Tool results dominate the delta; the advisor needs the gist, not the body.
+
+    A read_file of a large file injects thousands of tokens into every review,
+    and max_delta_chars does not catch it because it truncates the JOINED
+    result, not each row.
+    """
+    hist = [
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"function": {"name": "read_file",
+                                      "arguments": json.dumps({"path": "runtime.py"})}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "line of code\n" * 400},
+    ]
+    _cursor, rendered = delta.extract_delta(
+        cursor_len=None, conversation_history=hist,
+        assistant_response="Reviewed the file.", max_chars=20000,
+    )
+    assert len(rendered) < 4000, (
+        f"tool results must be capped per row, got {len(rendered)} chars"
+    )

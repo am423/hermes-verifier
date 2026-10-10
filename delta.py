@@ -93,6 +93,13 @@ def _content_to_text(content: Any, cap: int = 4000) -> str:
     return str(content)
 
 
+# Tool results are the single biggest cost driver in a review delta: a
+# read_file of a large file injects thousands of tokens the advisor almost never
+# needs in full. Capped per row, because max_delta_chars truncates the JOINED
+# result and so does not bound a single verbose row.
+_TOOL_RESULT_CAP = 1500
+
+
 def render_message(message: Dict[str, Any], cap: int = 6000) -> str:
     """Render one history message as a compact transcript row."""
     role = message.get("role", "?")
@@ -120,6 +127,8 @@ def render_message(message: Dict[str, Any], cap: int = 6000) -> str:
     role_label = role
     if role == "tool" and tool_call_id:
         role_label = f"tool({tool_call_id[:12]})"
+        if len(content) > _TOOL_RESULT_CAP:
+            content = content[:_TOOL_RESULT_CAP] + "\n… [tool result truncated]"
 
     text = redact(strip_findings(content))
     return f"[{role_label}] {text}"[:cap]
