@@ -1030,3 +1030,53 @@ def test_immunity_cooldown_expires(ctx, monkeypatch):
     _turn(ctx, history=[{"role": "user", "content": "t4"}], response="a4")
     assert runtime.handle_pre_verify(session_id="s1") is not None, \
         "immunity must expire so a real blocker can steer"
+
+
+def test_budget_counts_retry_as_one_review(ctx, monkeypatch):
+    """The empty-response retry must not double-spend the budget."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["max_reviews_per_session"] = 2
+    calls = {"n": 0}
+
+    def _flaky(**kw):
+        calls["n"] += 1
+        # First call of each review is empty; the retry returns a finding.
+        if calls["n"] % 2 == 1:
+            return FakeResult(None, text="")
+        return FakeResult({"severity": "note", "finding": "queue nit",
+                           "reasoning": ""})
+
+    ctx.llm.complete_structured = _flaky
+    _turn(ctx)
+    _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
+
+    state = runtime._get_state("s1", create=False)
+    assert state.reviews_used == 2, "two reviews consumed, retries included"
+    assert calls["n"] == 4, "2 reviews x (1 empty + 1 retry) = 4 provider calls"
+
+
+def test_budget_blocks_after_cap_with_retries(ctx, monkeypatch):
+    """No provider call at all once the cap is reached."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["max_reviews_per_session"] = 1
+    ctx.llm.complete_structured = lambda **kw: FakeResult(None, text="")
+    _turn(ctx)
+    before = len(ctx.llm.calls)
+    _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
+    assert len(ctx.llm.calls) == before, "the cap must hold even when retrying"
+
+
+def test_session_eviction_is_bounded():
+    """_SESSIONS must not grow without bound across many sessions."""
+    original = dict(runtime._SESSIONS)
+    try:
+        runtime._SESSIONS.clear()
+        for i in range(runtime._MAX_SESSIONS + 10):
+            runtime._get_state(f"session-{i}")
+        assert len(runtime._SESSIONS) <= runtime._MAX_SESSIONS, (
+            f"_SESSIONS grew to {len(runtime._SESSIONS)} "
+            f"(cap {runtime._MAX_SESSIONS})"
+        )
+    finally:
+        runtime._SESSIONS.clear()
+        runtime._SESSIONS.update(original)
