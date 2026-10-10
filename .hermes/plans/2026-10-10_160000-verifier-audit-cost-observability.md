@@ -33,27 +33,33 @@ runtime.py:528    verifier.stats.setdefault("prompt_parts", {   # (1) freezes at
 1. `setdefault` never updates after the first review, so the numbers are the first review's sizes forever.
 2. `prompt_parts` appears **once** in `runtime.py` and is absent from the `record` dict (`runtime.py:390-405`), so it never reaches the jsonl. It is in-memory only and invisible to every log.
 
-**A3 — The `max_delta_chars` explanation is an unconfirmed hypothesis, and my earlier "solved"/"1.7x" claims were wrong.**
+**A3 — RESOLVED by measurement: the provider bills ~2.48x the tiktoken count.**
 
-`delta.py` truncates on `len(tail) > max_chars` with `max_delta_chars: 20000` (chars). An earlier version of this plan claimed that explains the observed cost, with a "1.7x underestimate". **That was an inference reported as a measurement and is retracted.**
+`delta.py` truncates on `len(tail) > max_chars` with `max_delta_chars: 20000` (chars). An earlier version of this entry claimed a "1.7x underestimate" with a fitted 2.2–2.5 chars/token figure. **Both were inferences reported as measurements and are retracted.**
 
-What was actually measured, with a real tokenizer (`tiktoken`, `cl100k_base`):
+What was measured, with a real tokenizer (`tiktoken`, `cl100k_base`) and then against the provider's own billing:
 
-| Content | chars | tokens | chars/token |
+| Content | chars | tiktoken tokens | chars/tok |
 | --- | --- | --- | --- |
-| Escaped-JSON terminal row | 140 | 46 | **3.04** |
+| Escaped-JSON terminal row | 140 | 46 | 3.04 |
 | Prose | 450 | 101 | 4.46 |
-| Full realistic delta (max size) | 10,352 | 2,615 | **3.96** |
+| Delta built to the **20,000-char cap** | 20,020 | 5,006 | 4.00 |
 
-Assembling a realistically-sized prompt from real components — delta 2,615 + system prompt 268 + tool block 113 + task 26 + schema 51 — totals **3,073 tokens**.
+Then, from three live reviews once the telemetry existed, `est_tokens` (tiktoken-derived) vs `usage.input_tokens` (billed):
 
-Observed per-review input for the 9 rows in this session: **5,286 – 10,413**.
+| est | actual billed | ratio |
+| --- | --- | --- |
+| 693 | 1,705 | 2.46 |
+| 831 | 1,982 | 2.39 |
+| 618 | 1,598 | 2.59 |
 
-**So the reconstruction falls short and does NOT confirm the mechanism.** Two candidate explanations remain open: (a) Claude's tokenizer produces materially more tokens than `cl100k_base` on this content (tiktoken is a proxy, not Claude's tokenizer, and Anthropic publishes none), or (b) the real deltas were larger than my reconstruction. The true delta size for those rows is **unrecoverable**: `delta_excerpt` was capped at 400 chars when they were written.
+**The provider bills ~2.48x the tiktoken count — ~1.60 chars per billed token, not 4.00.**
 
-**Verified:** all 9 rows belong to session `20261010_003202_ad2365` — **this desktop conversation**. Probes wrote no rows, and my earlier "reproducible across sessions" claim was wrong.
+So a delta at the 20,000-char cap costs **~12,400 billed tokens**, and the observed 5,286–10,413 range corresponds to deltas that were large but below cap. The mechanism is confirmed: a character cap, amplified by a tokenizer ~2.5x heavier than assumed.
 
-**Task 1.5 is the check that confirms or refutes A3.** Do not tune any cap before it produces `est` vs `actual_in` for real reviews.
+A previous version of this entry said the reconstruction "falls short and does NOT confirm the mechanism", based on a delta that was only 10,352 chars (~52% of the cap). **That conclusion was wrong twice over** — undersized input *and* the wrong tokenizer model. It is superseded by the table above.
+
+**Verified:** all early rows belong to session `20261010_003202_ad2365` — this desktop conversation. Probes wrote no rows until the Phase 3 drain landed, and an earlier "reproducible across sessions" claim was wrong.
 
 **A4 — One-shot CLI reviews are lost, and `sync_backlog` does not prevent it.**
 The review runs on a daemon thread (`runtime.py:595`). `hermes chat -q` exits at turn end — measured `Turn ended` and `_run_review entered` in the same millisecond. Instrumented run: `_review_one` entered → `calling llm` → process gone, no row.
@@ -533,7 +539,7 @@ hermes plugins doctor . --ci
 
 3. **`atexit` and daemon threads are best-effort.** Interpreter shutdown gives no guarantee; `atexit` runs before daemon threads are killed, which is why it should work, but Task 3.3 is the empirical check. If it does not, the honest outcome is to document "one-shot CLI runs may not get a review" rather than fake a fix.
 
-4. **The chars/token constant is a measured proxy, not the provider's tokenizer.** 3.96 comes from `tiktoken/cl100k_base` on realistic deltas. Anthropic publishes no tokenizer and the advisor runs on Claude via Nous Portal, so the true ratio may differ — and the reconstruction gap (3,073 predicted vs 5,286–10,413 observed) is *unexplained* and may be exactly this. Task 1.5 settles it with real `est` vs `actual_in` pairs; the ratio to trust is the observed one, not the constant.
+4. **The chars/token constant is measured, and the provider's tokenizer is ~2.5x heavier than tiktoken.** The 2.48x ratio came from three live `est` vs `actual` pairs (2.46 / 2.39 / 2.59) — tight enough to trust, small enough that occasional re-checks are worthwhile. `est_tokens` uses the measured ~1.60 chars/token. This also resolved the earlier "unexplained gap", which was caused by an undersized test delta plus the wrong tokenizer model.
 
 5. **Open question — is a token-based cap worth it?** After Task 1.5 there will be `est` vs `actual_in` per review for the first time. If the ratio is stable, a `max_delta_tokens` setting is justified. If it swings widely, a char cap plus telemetry is the better call. **Do not add the setting before that data exists.**
 

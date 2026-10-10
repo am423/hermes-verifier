@@ -51,6 +51,9 @@ control it.
 - The delta has been redacted; you never see secrets and must not ask for them.
 - Review only the DELTA since your last review, not the whole conversation.
 - Keep findings under 200 words.
+- Budget your whole reply to about 300 tokens. The operator pays for every \
+token: two sentences of reasoning is plenty, and a finding longer than 120 \
+words is too long to act on. Prefer one concrete sentence over three hedged ones.
 """
 
 REVIEW_TASK = (

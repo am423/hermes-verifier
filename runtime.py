@@ -61,10 +61,13 @@ REVIEW_SCHEMA = {
         },
         "reasoning": {
             "type": "string",
-            "description": "One or two sentences of private reasoning; shown only in the verifier transcript.",
+            "description": "Diagnostics, shown only in /verify dump raw. Keep to one or two sentences.",
         },
     },
-    "required": ["severity", "finding", "reasoning"],
+    # severity + finding ARE the deliverable; reasoning is diagnostics. Requiring
+    # the trailing diagnostics field meant a response truncated after `finding`
+    # failed validation and lost the entire review.
+    "required": ["severity", "finding"],
     "additionalProperties": False,
 }
 
@@ -537,7 +540,22 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
     if not isinstance(parsed, dict):
         # Non-empty but unparseable, or still empty after the in-loop retry.
         # Both are surfaced rather than dropped silently.
-        if result is not None and not getattr(result, "text", ""):
+        text_len = len(getattr(result, "text", "") or "") if result is not None else 0
+        if text_len:
+            # A cut-off JSON response (e.g. advisor_max_tokens truncation) lands
+            # here. It must be visible: silent loss looks identical to "the
+            # advisor had nothing to say".
+            with _LOCK:
+                state.last_error = (
+                    f"unparseable review response ({text_len} chars, not JSON) — "
+                    "likely truncated by advisor_max_tokens or the provider"
+                )[:300]
+            publish_event("error", {"session_id": state.session_id,
+                                    "verifier": verifier.slug,
+                                    "error": state.last_error})
+            logger.warning("verifier %s returned unparseable output for %s (%d chars)",
+                           verifier.slug, state.session_id, text_len)
+        else:
             with _LOCK:
                 state.last_error = (
                     f"empty completion persisted after retry (empty #"
@@ -548,9 +566,6 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
                                     "error": state.last_error})
             logger.warning("verifier %s still empty after retry for %s",
                            verifier.slug, state.session_id)
-        else:
-            logger.debug("verifier %s returned non-JSON for %s",
-                         verifier.slug, state.session_id)
         return
     severity = str(parsed.get("severity") or "none").strip().lower()
     finding_text = str(parsed.get("finding") or "").strip()

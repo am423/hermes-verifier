@@ -1204,3 +1204,61 @@ def test_dashboard_exposes_cost_rollup():
     assert cost["input_tokens"] == 5000
     assert cost["empty_responses"] == 2
     assert cost["last_input_tokens"] == 1705
+
+
+def test_truncated_response_is_surfaced_not_silently_dropped(ctx, monkeypatch):
+    """A response cut off by max_tokens must be visible, not a debug line.
+
+    If advisor_max_tokens truncates mid-JSON, parsing fails and the review is
+    lost. That must not be silent — it looks identical to "the advisor had
+    nothing to say".
+    """
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    # Truncated JSON: non-empty text, no parsed payload.
+    ctx.llm.next = FakeResult(None, text='{"severity": "caution", "finding": "The code')
+
+    _turn(ctx)
+
+    state = runtime._get_state("s1", create=False)
+    assert state.last_error, "a truncated response must surface an error"
+    assert _default(state).pending is None
+
+
+def test_schema_accepts_response_without_reasoning(ctx, monkeypatch):
+    """reasoning is diagnostics; requiring it costs the whole review on truncation.
+
+    A response cut off by max_tokens after `finding` still contains the entire
+    deliverable. Requiring a trailing diagnostics field turned that into a total
+    loss — measured: jsonschema rejects {'severity','finding'} with
+    "'reasoning' is a required property".
+    """
+    import jsonschema
+    partial = {"severity": "caution",
+               "finding": "os.system with unsanitized input is command injection"}
+    # Must validate: this is what a truncated-but-usable response looks like.
+    jsonschema.validate(partial, runtime.REVIEW_SCHEMA)
+    assert "reasoning" not in runtime.REVIEW_SCHEMA["required"]
+    assert "reasoning" in runtime.REVIEW_SCHEMA["properties"], \
+        "keep emitting it when available"
+
+
+def test_advisor_max_tokens_reaches_the_provider(ctx, monkeypatch):
+    """The output cap must actually be sent, and must not fire below 1024.
+
+    Provider minimum is 1024, so a lower value is ignored rather than sent and
+    rejected — plugin.yaml says the same.
+    """
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+
+    # Below the provider minimum: not sent at all.
+    ctx.config["advisor_max_tokens"] = 500
+    ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
+    _turn(ctx)
+    assert "max_tokens" not in ctx.llm.calls[-1], \
+        "a sub-1024 cap must be ignored, not sent"
+
+    # At or above the minimum: sent through.
+    ctx.config["advisor_max_tokens"] = 1200
+    ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
+    _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
+    assert ctx.llm.calls[-1].get("max_tokens") == 1200
