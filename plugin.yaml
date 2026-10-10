@@ -68,3 +68,11 @@ config_schema:
     type: int
     default: 0
     description: "Inject a consultation reminder into the first N turns of a session. Claude Code found +7pp on Haiku-class executors, neutral on Sonnet, slightly negative on Opus. 0 = off."
+  semantic_dedupe_threshold:
+    type: float
+    default: 0.0
+    description: "Suppress a RESTATED finding the exact-text guard missed, when the local decision model is at least this confident the two describe the same issue. 0 = off. Requires the d1-omni sidecar; unreachable or unsure keeps the finding. Measured: 0 wrongly-suppressed pairs at 0.5-0.95."
+  semantic_dedupe_url:
+    type: str
+    default: "http://127.0.0.1:8765/same-issue"
+    description: "Endpoint for the semantic-dedupe decision. Empty disables the stage."

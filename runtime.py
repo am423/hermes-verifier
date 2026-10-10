@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from . import advisor_tools as tools_mod
 from . import brief, delta as delta_mod, guard as guard_mod
+from . import dedupe as dedupe_mod
 
 logger = logging.getLogger("hermes-verifier")
 
@@ -78,6 +79,8 @@ REVIEW_SCHEMA = {
 _LOCK = threading.RLock()
 _SESSIONS: Dict[str, "SessionVerifier"] = {}
 _MAX_SESSIONS = 64
+# Recent delivered findings kept per verifier, for semantic dedupe comparison.
+_MAX_RECENT_FINDINGS = 5
 _MAX_INFLIGHT = 2
 _INFLIGHT = threading.BoundedSemaphore(_MAX_INFLIGHT)
 _BACKLOG_WAIT_CAP = 30.0
@@ -138,6 +141,9 @@ class Verifier:
     shared_instructions: str = ""
     guard: guard_mod.EmissionGuard = field(default_factory=guard_mod.EmissionGuard)
     pending: Optional[Dict[str, Any]] = None
+    # Recently delivered findings, newest last. Used only by semantic dedupe:
+    # the exact-text guard cannot tell a restatement from a new finding.
+    recent_findings: List[str] = field(default_factory=list)
     stats: Dict[str, Any] = field(
         default_factory=lambda: {
             "reviews": 0, "findings": 0, "blockers": 0, "cautions": 0,
@@ -149,6 +155,7 @@ class Verifier:
     def reset(self) -> None:
         self.guard.reset()
         self.pending = None
+        self.recent_findings.clear()
 
 
 @dataclass
@@ -589,8 +596,24 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
                             delta_excerpt=delta_text, prompt_parts=parts)
         return
     accepted = verifier.guard.accept(severity, finding_text)
+    # Semantic dedupe: the exact-text guard cannot catch a restatement, so a
+    # finding reported again in different words would re-surface and nag. This is
+    # the one application the local decision model is measurably good at, and it
+    # is safe to act on -- a suppressed duplicate loses a repeat, not a finding.
+    if accepted:
+        thr = float(_config(_CTX, "semantic_dedupe_threshold", 0.0) or 0.0)
+        if thr > 0 and verifier.recent_findings:
+            prob = dedupe_mod.ask(verifier.recent_findings[-1], finding_text)
+            if dedupe_mod.should_suppress(prob, threshold=thr):
+                logger.info("semantic dedupe suppressed a restatement for %s (p=%.3f)",
+                            state.session_id, prob)
+                accepted = False
     _record_and_deliver(state, verifier, parsed, accepted, usage,
                         delta_excerpt=delta_text, prompt_parts=parts)
+    if accepted:
+        verifier.recent_findings.append(finding_text)
+        while len(verifier.recent_findings) > _MAX_RECENT_FINDINGS:
+            verifier.recent_findings.pop(0)
 
 
 def _run_review(state: SessionVerifier, delta_text: str) -> None:

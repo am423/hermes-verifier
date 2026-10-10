@@ -36,6 +36,18 @@ QUESTIONS = {
     },
 }
 
+# Semantic dedupe. A comparison with both sides defined -- the shape the model
+# measurably handles best (sidecar/APPLICATIONS.md: +0.400 separation, 76%
+# pairwise, 0 wrongly-suppressed pairs from 0.5 to 0.95).
+SAME_ISSUE = {
+    "same_issue": {
+        "type": "noul",
+        "instructions": "Do these two review findings describe the same underlying issue?",
+        "criteria": {"yes": "they report the same problem, even in different words",
+                     "no": "they report different, unrelated problems"},
+    },
+}
+
 _model = None
 
 
@@ -60,7 +72,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self):  # noqa: N802
-        if self.path != "/decide":
+        if self.path not in ("/decide", "/same-issue"):
             self._json(404, {"error": "not found"})
             return
         try:
@@ -74,8 +86,9 @@ class Handler(BaseHTTPRequestHandler):
         if state is None:
             self._json(400, {"error": "missing 'state'"})
             return
+        questions = SAME_ISSUE if self.path == "/same-issue" else QUESTIONS
         try:
-            answers = get_model().system_one(str(state), QUESTIONS)
+            answers = get_model().system_one(str(state), questions)
         except Exception as exc:  # never 500 a gate: the plugin fails open anyway
             log.warning("decision failed: %s", exc)
             self._json(200, {"error": str(exc)[:200]})

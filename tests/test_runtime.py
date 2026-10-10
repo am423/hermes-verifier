@@ -1262,3 +1262,83 @@ def test_advisor_max_tokens_reaches_the_provider(ctx, monkeypatch):
     ctx.llm.next = FakeResult({"severity": "none", "finding": "", "reasoning": ""})
     _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
     assert ctx.llm.calls[-1].get("max_tokens") == 1200
+
+
+# ── Semantic dedupe (the measured-safe d1-omni application) ──────────────────
+
+
+def test_semantic_dedupe_suppresses_only_when_confident():
+    """Suppression is destructive, so it needs an explicit high-confidence yes.
+
+    Measured (sidecar/dedupe_probe.py): 0 wrongly-suppressed at every threshold
+    from 0.5 to 0.95, unlike the call gate which was unsafe at every threshold.
+    Uncertain, unreachable and disabled must all fall back to current behaviour
+    -- i.e. keep the finding.
+    """
+    from verifier_pkg import dedupe
+
+    assert dedupe.should_suppress(0.99, threshold=0.9) is True
+    assert dedupe.should_suppress(0.90, threshold=0.9) is True    # at the line
+    assert dedupe.should_suppress(0.85, threshold=0.9) is False   # uncertain -> keep
+    assert dedupe.should_suppress(None, threshold=0.9) is False   # unreachable -> keep
+    assert dedupe.should_suppress(0.999, threshold=0.0) is False  # disabled -> keep
+
+
+def test_semantic_dedupe_is_off_by_default():
+    """No behaviour change unless an operator turns it on."""
+    from verifier_pkg import dedupe
+    assert dedupe.DEFAULT_THRESHOLD == 0.0
+
+
+def test_semantic_dedupe_suppresses_a_restatement(ctx, monkeypatch):
+    """A restated finding is suppressed when the model is confident.
+
+    The exact-text guard cannot catch a paraphrase, so without this a finding
+    re-surfaces in different words and nags. Suppressed findings are still
+    RECORDED (accepted=False) so the decision stays visible.
+    """
+    from verifier_pkg import dedupe
+
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["semantic_dedupe_threshold"] = 0.9
+    monkeypatch.setattr(dedupe, "ask", lambda a, b, **k: 0.99)   # confident restatement
+
+    ctx.llm.next = FakeResult({"severity": "caution",
+                               "finding": "The write path bypasses the durable queue",
+                               "reasoning": ""})
+    _turn(ctx)
+    v = _default(runtime._get_state("s1", create=False))
+    assert v.pending is not None, "the first finding must be delivered"
+    runtime.handle_pre_llm_call(session_id="s1")        # consume it
+
+    ctx.llm.next = FakeResult({"severity": "caution",
+                               "finding": "src/jobs/write.py enqueues directly",
+                               "reasoning": ""})
+    _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
+
+    v = _default(runtime._get_state("s1", create=False))
+    assert v.pending is None, "the paraphrase must not be delivered"
+
+    rows = [json.loads(l) for l in
+            runtime._log_path("s1", "default").read_text().splitlines()]
+    assert rows[-1]["accepted"] is False, "the suppression must be recorded"
+
+
+def test_semantic_dedupe_keeps_finding_when_unsure(ctx, monkeypatch):
+    """Below the threshold the finding is delivered exactly as today."""
+    from verifier_pkg import dedupe
+
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["semantic_dedupe_threshold"] = 0.9
+    monkeypatch.setattr(dedupe, "ask", lambda a, b, **k: 0.4)    # not confident
+
+    ctx.llm.next = FakeResult({"severity": "caution", "finding": "first issue",
+                               "reasoning": ""})
+    _turn(ctx)
+    runtime.handle_pre_llm_call(session_id="s1")
+    ctx.llm.next = FakeResult({"severity": "caution", "finding": "second issue",
+                               "reasoning": ""})
+    _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
+
+    v = _default(runtime._get_state("s1", create=False))
+    assert v.pending is not None, "an unsure dedupe must not drop findings"
