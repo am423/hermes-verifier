@@ -565,7 +565,13 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
         # A verifier with no grant is never told about tools, so it makes exactly
         # one call — parse_tool_call would refuse anyway, but skipping the loop
         # keeps its transcript and prompt byte-identical to the pre-tools build.
-        attempts = tools_mod.MAX_TOOL_CALLS + 1 if grant else 1
+        # One initial call, one follow-up per PERMITTED tool call, and one final
+        # call to consume the "budget exhausted, answer now" re-prompt. Without
+        # that last slot the re-prompt consumed the final iteration and the
+        # envelope was never requested.
+        attempts = tools_mod.MAX_TOOL_CALLS + 2 if grant else 1
+        dispatches = 0
+        refused_tool_call = False
         for _attempt in range(attempts):
             result = _call_structured(
                 ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
@@ -590,6 +596,21 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
             call = tools_mod.parse_tool_call(getattr(result, "text", "") or "", grant)
             if call is None:
                 break
+            if dispatches >= tools_mod.MAX_TOOL_CALLS:
+                # The prompt promises "at most MAX_TOOL_CALLS per review", so a
+                # model that keeps asking must NOT be granted a call we said we
+                # would not make. Ask for the envelope instead -- previously this
+                # iteration dispatched anyway, and when the model answered with
+                # YET another tool call the loop ended with the review unrequested
+                # and the queued finding lost, blamed on a truncated response.
+                refused_tool_call = True
+                transcript = (
+                    f"{delta_text}\n\n---\nTool budget exhausted "
+                    f"({tools_mod.MAX_TOOL_CALLS} calls used). "
+                    "Give your final review envelope now (severity/finding/reasoning)."
+                )
+                continue
+            dispatches += 1
             # The reviewer prompt promises "you never see secrets" (brief.py).
             # That held for the transcript delta, but tool output was spliced in
             # RAW -- a read_file over a config or key file shipped the secret
@@ -640,10 +661,22 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
             # here. It must be visible: silent loss looks identical to "the
             # advisor had nothing to say".
             with _LOCK:
-                state.last_error = (
-                    f"unparseable review response ({text_len} chars, not JSON) — "
-                    "likely truncated by advisor_max_tokens or the provider"
-                )[:300]
+                if refused_tool_call and "TOOL_CALL" in (
+                        getattr(result, "text", "") or ""):
+                    # The real cause, not a guess: the model kept asking for tools
+                    # it had already used up, so no envelope was ever produced.
+                    # Blaming advisor_max_tokens here sent operators to raise a
+                    # token cap that was never the problem.
+                    state.last_error = (
+                        f"the reviewer kept requesting tools after the "
+                        f"{tools_mod.MAX_TOOL_CALLS}-call budget was spent and "
+                        "never produced a review envelope"
+                    )[:300]
+                else:
+                    state.last_error = (
+                        f"unparseable review response ({text_len} chars, not JSON) — "
+                        "likely truncated by advisor_max_tokens or the provider"
+                    )[:300]
             publish_event("error", {"session_id": state.session_id,
                                     "verifier": verifier.slug,
                                     "error": state.last_error})
