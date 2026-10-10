@@ -596,15 +596,26 @@ def test_default_tools_grant_applies_without_a_roster(ctx, monkeypatch):
 def test_advisor_tools_off_by_default(ctx, monkeypatch):
     """Zero-config behavior is unchanged: one call, no tool dispatch."""
     monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
-    ctx.llm.next = FakeResult({"severity": "note", "finding": "nit: rename x", "reasoning": ""})
     dispatched = []
-    ctx.dispatch_tool = lambda name, args: dispatched.append(n) or "should not happen"
+
+    def _complete(**kwargs):
+        ctx.llm.calls.append(kwargs)
+        # Script the protocol line even though no grant is configured: if the
+        # tool path were wrongly armed, this is what would make it fire. (The
+        # previous version scripted an ordinary envelope, so the dispatch lambda
+        # never ran -- and it referenced an undefined `n`, which
+        # advisor_tools.dispatch swallowed. The canary could not go off.)
+        return FakeResult(None, text='TOOL_CALL: read_file {"path": "a.py"}')
+
+    ctx.llm.complete_structured = _complete
+    ctx.dispatch_tool = lambda name, args: dispatched.append((name, args)) or "no"
 
     _turn(ctx)
 
-    assert len(ctx.llm.calls) == 1
-    assert dispatched == []
-    assert "TOOL_CALL" not in ctx.llm.calls[0]["system_prompt"]
+    assert "TOOL_CALL" not in ctx.llm.calls[0]["system_prompt"], (
+        "the tool protocol was offered with no grant configured"
+    )
+    assert dispatched == [], "a tool was dispatched with no grant configured"
 
 
 # ── Review budget (max_uses, session-scoped) ─────────────────────────────────
@@ -1150,14 +1161,69 @@ def test_status_reports_token_estimate(ctx, monkeypatch):
 # ── Review durability at process exit ────────────────────────────────────────
 
 
-def test_pending_reviews_can_be_drained():
+def test_drain_reviews_waits_for_a_real_review():
     """Short-lived processes must be able to wait for in-flight reviews.
 
-    hermes chat -q exits at turn end and the daemon review thread dies with it,
-    so the review and its telemetry are lost.
+    `hermes chat -q` exits at turn end and the daemon review thread dies with it,
+    so the review and its telemetry are lost. This is the only cover for the
+    atexit drain -- the previous version called it with NOTHING in flight and
+    asserted isinstance(result, bool), so a broken join, a broken timeout, or a
+    registry that never pruned all passed.
     """
-    drained = runtime.drain_reviews(timeout=0.01)
-    assert isinstance(drained, bool)
+    import threading
+    import time
+
+    finished = []
+
+    def slow_review():
+        time.sleep(0.2)
+        finished.append(True)
+
+    thread = threading.Thread(target=slow_review, daemon=True)
+    with runtime._THREADS_LOCK:
+        runtime._ACTIVE_REVIEWS.add(thread)
+    thread.start()
+    started = time.monotonic()
+    try:
+        drained = runtime.drain_reviews(timeout=2.0)
+    finally:
+        thread.join(timeout=2)
+        with runtime._THREADS_LOCK:
+            runtime._ACTIVE_REVIEWS.discard(thread)
+    elapsed = time.monotonic() - started
+
+    assert drained is True, "the drain reported failure for a review it could wait for"
+    assert finished, "the drain returned before the review had finished"
+    assert elapsed >= 0.15, f"the drain did not actually wait (returned in {elapsed:.3f}s)"
+
+
+def test_drain_reviews_is_bounded_when_a_review_is_stuck():
+    import threading
+    import time
+
+    stop = threading.Event()
+    thread = threading.Thread(target=stop.wait, args=(5,), daemon=True)
+    with runtime._THREADS_LOCK:
+        runtime._ACTIVE_REVIEWS.add(thread)
+    thread.start()
+    try:
+        started = time.monotonic()
+        drained = runtime.drain_reviews(timeout=0.05)
+        elapsed = time.monotonic() - started
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        with runtime._THREADS_LOCK:
+            runtime._ACTIVE_REVIEWS.discard(thread)
+
+    assert drained is False, "a stuck review must report a timeout, not success"
+    assert elapsed < 1.0, "the drain must be bounded by its timeout"
+
+
+def test_drain_reviews_is_true_when_nothing_is_in_flight():
+    with runtime._THREADS_LOCK:
+        runtime._ACTIVE_REVIEWS.clear()
+    assert runtime.drain_reviews(timeout=0.05) is True
 
 
 def test_dashboard_exposes_cost_rollup():
