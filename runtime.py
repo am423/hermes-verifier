@@ -468,10 +468,7 @@ def read_jsonl_tail(path: Path, limit: int = 100) -> List[Dict[str, Any]]:
         size = path.stat().st_size
     except OSError:
         return []
-    if size <= _TAIL_WINDOW_BYTES:
-        window, offset = size, 0
-    else:
-        window, offset = _TAIL_WINDOW_BYTES, size - _TAIL_WINDOW_BYTES
+    offset = 0 if size <= _TAIL_WINDOW_BYTES else size - _TAIL_WINDOW_BYTES
     try:
         with open(path, "rb") as handle:
             handle.seek(offset)
