@@ -361,9 +361,22 @@ function VerifierOpenPage({ ctx }) {
         }
         if (sid) {
           try {
-            await ctx.rest('/verifier-session', { method: 'POST', body: { session_id: sid } })
+            // The response was ignored entirely, so BOTH a thrown failure and a
+            // 200-with-ok:false (designation applied but not persisted, so it
+            // will not survive a restart) passed silently and the user was left
+            // with a session that looked designated and was not.
+            const res = await ctx.rest('/verifier-session',
+                                       { method: 'POST', body: { session_id: sid } })
+            if (res && res.ok === false) {
+              // Non-blocking: the verifier IS attached for this session, so the
+              // session should still open -- but the user has to know it will
+              // not come back after a restart.
+              host.notifyError(
+                new Error(String(res.error || 'the designation could not be saved')),
+                'Verifier Mode: attached, but the designation was not saved')
+            }
           } catch (e) {
-            /* designation failed; the session still opens without verifier */
+            host.notifyError(e, 'Verifier Mode: could not attach the verifier')
           }
         }
       }
