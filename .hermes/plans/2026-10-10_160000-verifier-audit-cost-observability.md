@@ -648,3 +648,40 @@ with and without the `reasoning` field in the schema — so the only variable is
 the field. The prompt-instruction A/B (3b) was not controlled this way.
 
 **Nothing in this addendum should be used to size a cost-saving change.**
+
+### 3d. The A/B result in 3b is VOID — it measured nothing (n=0 findings)
+
+Section 3b reported "no measurable effect" with "one finding in the A/B window".
+Both are wrong. Proof by session id, which shows *which process* wrote each row:
+
+| time | session | process | severity | out |
+| --- | --- | --- | --- | --- |
+| 12:54:01 | `_003202_ad2365` | DESKTOP (stale code) | caution | 799 |
+| 12:56:15 | `_125521_b9b6d3` | A/B (fresh) | **none** | 75 |
+| 12:57:07 | `_003202_ad2365` | DESKTOP (stale code) | caution | **838** |
+| 12:57:10 | `_125620_6d07b4` | A/B (fresh) | **none** | 235 |
+| 12:57:56 | `_125714_84ee0d` | A/B (fresh) | **none** | 66 |
+| 13:00:14 | `_003202_ad2365` | DESKTOP (stale code) | caution | 1262 |
+| 13:00:40 | `_003202_ad2365` | DESKTOP (stale code) | caution | 1233 |
+| 13:00:59 | `_130050_ab48cf` | A/B (fresh) | **none** | 42 |
+| 13:01:55 | `_130117_a4da65` | A/B (fresh) | **none** | 622 |
+
+**Every A/B session returned `severity: none`. The 838-token finding I cited was
+written by the desktop process running stale code — it was never part of the A/B.**
+
+So the comparison has **no data at all** — not "inconclusive (n=1)", which is
+what the subsequent correction claimed, but n=0. The 939→931 mean shift was
+computed over a mix of stale-process findings and was never an after-only
+comparison.
+
+**Root cause of the misattribution:** the desktop process started at 12:23AM and
+held pre-change code for the whole window, while `hermes chat -q` sessions load
+fresh code. Rows from the two are indistinguishable except by `session_id`, and
+`prompt_parts` (which only the fresh code writes) is the tell.
+
+**Rule this establishes:** before comparing any two configurations, confirm
+which process wrote each row — check `session_id` and the presence of
+version-specific fields. A stale long-lived process can silently contribute the
+majority of the data.
+
+**The prompt-instruction question remains OPEN.** It has never been measured.
