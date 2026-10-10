@@ -81,6 +81,11 @@ _SESSIONS: Dict[str, "SessionVerifier"] = {}
 _MAX_SESSIONS = 64
 _MAX_INFLIGHT = 2
 _INFLIGHT = threading.BoundedSemaphore(_MAX_INFLIGHT)
+# How many undelivered findings a verifier may queue. Two review cycles can
+# finish between two primary turns (_MAX_INFLIGHT is 2), and a single slot let
+# the second accepted finding silently overwrite the first.
+_MAX_PENDING = 5
+
 _BACKLOG_WAIT_CAP = 30.0
 _BACKLOG_POLL = 0.1
 
@@ -141,7 +146,9 @@ class Verifier:
     instructions: str = ""
     shared_instructions: str = ""
     guard: guard_mod.EmissionGuard = field(default_factory=guard_mod.EmissionGuard)
-    pending: Optional[Dict[str, Any]] = None
+    # Undelivered findings, oldest first. A QUEUE, not a slot: concurrent
+    # review cycles can each accept a finding before the next primary turn.
+    pending: List[Dict[str, Any]] = field(default_factory=list)
     stats: Dict[str, Any] = field(
         default_factory=lambda: {
             "reviews": 0, "findings": 0, "blockers": 0, "cautions": 0,
@@ -152,7 +159,7 @@ class Verifier:
 
     def reset(self) -> None:
         self.guard.reset()
-        self.pending = None
+        self.pending.clear()
 
 
 @dataclass
@@ -464,12 +471,31 @@ def _record_and_deliver(state: SessionVerifier, verifier: Verifier,
         return
     verifier.stats["findings"] += 1
     verifier.stats[severity + "s"] = verifier.stats.get(severity + "s", 0) + 1
-    verifier.pending = {
-        "severity": severity,
-        "finding": finding_text,
-        "reasoning": reasoning,
-        "origin_turn": origin_turn,
-    }
+    with _LOCK:
+        verifier.pending.append({
+            "severity": severity,
+            "finding": finding_text,
+            "reasoning": reasoning,
+            "origin_turn": origin_turn,
+        })
+        # Bounded: a reviewer that stays slow must not queue without limit. An
+        # older finding is dropped rather than the new one, and the drop is
+        # published -- losing a finding silently is the failure mode this whole
+        # queue exists to remove.
+        if len(verifier.pending) > _MAX_PENDING:
+            dropped = verifier.pending.pop(0)
+            publish_event("finding_dropped", {
+                "session_id": state.session_id,
+                "verifier": verifier.slug,
+                "severity": dropped.get("severity", "note"),
+                "origin_turn": dropped.get("origin_turn", 0),
+                "reason": "pending queue overflow",
+            })
+            logger.warning(
+                "verifier %s pending queue overflow (%d); dropped an undelivered "
+                "%s finding from turn %s", verifier.slug, _MAX_PENDING,
+                dropped.get("severity"), dropped.get("origin_turn"),
+            )
     publish_event("finding", {"session_id": state.session_id,
                               "verifier": verifier.slug, "severity": severity,
                               "finding": finding_text[:240],
@@ -959,29 +985,31 @@ def handle_pre_llm_call(session_id: Any = "", **kwargs: Any) -> Optional[Dict[st
             nudge = NUDGE_TEXT
         state.turns_seen += 1
     with _LOCK:
-        pending = {slug: v.pending for slug, v in state.verifiers.items()
-                   if v.pending is not None}
+        pending = {slug: list(v.pending) for slug, v in state.verifiers.items()
+                   if v.pending}
         for verifier in state.verifiers.values():
-            verifier.pending = None
+            verifier.pending.clear()
         # The turn now starting. A finding is accounted to its origin_turn, so
         # this is recorded only to make the gap visible -- a finding that lands
         # many turns late is a pacing symptom, not a finding about this turn.
         delivered_turn = state.turns_seen
-    for slug, finding in pending.items():
-        publish_event("finding_delivered", {
-            "session_id": state.session_id,
-            "verifier": slug,
-            "severity": finding.get("severity", "note"),
-            "origin_turn": int(finding.get("origin_turn") or 0),
-            "delivered_turn": delivered_turn,
-        })
+    for slug, findings in pending.items():
+        for finding in findings:
+            publish_event("finding_delivered", {
+                "session_id": state.session_id,
+                "verifier": slug,
+                "severity": finding.get("severity", "note"),
+                "origin_turn": int(finding.get("origin_turn") or 0),
+                "delivered_turn": delivered_turn,
+            })
     if not pending and not nudge:
         # A quiet turn still ticks the immunity clock down. Without this the
         # cooldown could never drain, so one early blocker would mute the
         # advisor for the rest of the session.
         state.immunity_left = max(0, state.immunity_left - 1)
         return None
-    severities = {f.get("severity", "note") for f in pending.values()}
+    severities = {f.get("severity", "note")
+                  for findings in pending.values() for f in findings}
     if severities & {"caution", "blocker"}:
         # Only arm the cooldown when it is not already running. Re-arming on
         # every delivery would make a recurring blocker permanently immune,
@@ -990,7 +1018,8 @@ def handle_pre_llm_call(session_id: Any = "", **kwargs: Any) -> Optional[Dict[st
                                   int(_config(_CTX, "immunity_turns", 3) or 3))
     else:
         state.immunity_left = max(0, state.immunity_left - 1)
-    blocks = [_render_finding(slug, finding) for slug, finding in pending.items()]
+    blocks = [_render_finding(slug, finding)
+              for slug, findings in pending.items() for finding in findings]
     if nudge:
         blocks.insert(0, nudge)
     return {"context": "\n\n".join(blocks)}
@@ -1012,9 +1041,11 @@ def handle_pre_verify(session_id: Any = "", **kwargs: Any) -> Optional[Dict[str,
         blocker: Optional[Dict[str, Any]] = None
         blocker_verifier: Optional[Verifier] = None
         for verifier in state.enabled_verifiers():
-            if verifier.pending and verifier.pending.get("severity") == "blocker":
-                blocker = verifier.pending
-                verifier.pending = None
+            hit = next((f for f in verifier.pending
+                        if f.get("severity") == "blocker"), None)
+            if hit is not None:
+                blocker = hit
+                verifier.pending.remove(hit)   # only this one; the rest still ride
                 blocker_verifier = verifier
                 break
         if blocker is None:
@@ -1023,7 +1054,7 @@ def handle_pre_verify(session_id: Any = "", **kwargs: Any) -> Optional[Dict[str,
             # Not allowed to interrupt; the finding stays pending and rides the
             # next pre_llm_call injection instead.
             if blocker_verifier is not None:
-                blocker_verifier.pending = blocker
+                blocker_verifier.pending.insert(0, blocker)   # keep it oldest-first
             return None
         state.immunity_left = int(_config(_CTX, "immunity_turns", 3) or 3)
     text = str(blocker.get("finding", "")).strip()
@@ -1130,7 +1161,9 @@ def snapshot() -> Dict[str, Any]:
                     "model": verifier.model,
                     "tools": list(verifier.tools),
                     "stats": dict(verifier.stats),
-                    "pending": verifier.pending,
+                    "pending": len(verifier.pending),
+                    "pending_latest": (verifier.pending[-1]
+                                       if verifier.pending else None),
                 }
             sessions[key] = {
                 "session_id": st.session_id,

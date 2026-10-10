@@ -137,7 +137,7 @@ def test_full_cycle_raise_and_deliver(ctx, monkeypatch):
     state = runtime._get_state("s1", create=False)
     assert state is not None
     verifier = _default(state)
-    assert verifier.pending["severity"] == "caution"
+    assert verifier.pending[-1]["severity"] == "caution"
     assert verifier.stats["reviews"] == 1
     assert verifier.stats["cautions"] == 1
 
@@ -173,14 +173,14 @@ def test_duplicate_suppressed(ctx, monkeypatch):
     ctx.llm.next = FakeResult({"severity": "note", "finding": "Tidy the imports",
                                "reasoning": "unused"})
     _turn(ctx)
-    assert _default(runtime._get_state("s1")).pending is not None
+    assert _default(runtime._get_state("s1")).pending
     assert runtime.handle_pre_llm_call(session_id="s1") is not None
-    assert _default(runtime._get_state("s1")).pending is None
+    assert not _default(runtime._get_state("s1")).pending
 
     ctx.llm.next = FakeResult({"severity": "note", "finding": "Tidy the imports",
                                "reasoning": "again"})
     _turn(ctx)
-    assert _default(runtime._get_state("s1")).pending is None
+    assert not _default(runtime._get_state("s1")).pending
     assert _default(runtime._get_state("s1")).guard.stats["deduped"] == 1
 
     log = runtime._log_path("s1", "default")
@@ -194,7 +194,7 @@ def test_none_severity_no_finding(ctx, monkeypatch):
     ctx.llm.next = FakeResult({"severity": "none", "finding": "",
                                "reasoning": "clean turn"})
     _turn(ctx)
-    assert _default(runtime._get_state("s1")).pending is None
+    assert not _default(runtime._get_state("s1")).pending
     assert _default(runtime._get_state("s1")).stats["findings"] == 0
 
 
@@ -204,7 +204,7 @@ def test_llm_failure_records_error_no_crash(ctx, monkeypatch):
     _turn(ctx)
     state = runtime._get_state("s1", create=False)
     assert "RuntimeError" in state.last_error
-    assert _default(state).pending is None
+    assert not _default(state).pending
 
 
 def test_non_json_result_ignored(ctx, monkeypatch):
@@ -212,7 +212,7 @@ def test_non_json_result_ignored(ctx, monkeypatch):
     ctx.llm.next = FakeResult(None)
     _turn(ctx)
     state = runtime._get_state("s1", create=False)
-    assert _default(state).pending is None
+    assert not _default(state).pending
     assert _default(state).stats["reviews"] == 1
 
 
@@ -230,14 +230,14 @@ def test_blocker_steers_pre_verify(ctx, monkeypatch):
     assert steer is not None
     assert steer["action"] == "continue"
     assert "never exercised" in steer["message"]
-    assert _default(state).pending is None
+    assert not _default(state).pending
     assert state.immunity_left == 3
 
     ctx.llm.next = FakeResult({"severity": "blocker", "finding": "Second blocker",
                                "reasoning": "x"})
     _turn(ctx)
     assert runtime.handle_pre_verify(session_id="s1") is None
-    assert _default(state).pending is not None
+    assert _default(state).pending
 
 
 def test_caution_does_not_steer_pre_verify(ctx, monkeypatch):
@@ -256,11 +256,11 @@ def test_session_reset_reprimes(ctx, monkeypatch):
     _turn(ctx, history=[{"role": "user", "content": "a"}])
     state = runtime._get_state("s1", create=False)
     assert state.cursor_len == 1
-    assert _default(state).pending is not None
+    assert _default(state).pending
 
     runtime.handle_session_reset(session_id="s1")
     assert state.cursor_len is None
-    assert _default(state).pending is None
+    assert not _default(state).pending
     assert len(_default(state).guard) == 0
 
 
@@ -298,7 +298,7 @@ def test_roster_multi_verifier_review(ctx, monkeypatch):
     arch = state.verifiers["architecture"]
     assert arch.stats["reviews"] == 1
     assert _default(state).stats["reviews"] == 1
-    assert arch.pending is not None and _default(state).pending is not None
+    assert arch.pending and _default(state).pending
 
     # Both pendings deliver together on the next turn.
     injected = runtime.handle_pre_llm_call(session_id="s1")
@@ -486,7 +486,7 @@ def test_sync_backlog_int_setting_does_not_drop_finding(ctx, monkeypatch):
 
     state = runtime._get_state("s1", create=False)
     assert state.last_error == "", "handler swallowed an exception"
-    assert _default(state).pending is not None, "finding was dropped"
+    assert _default(state).pending, "finding was dropped"
 
 
 def test_backlog_wait_waits_then_releases(monkeypatch):
@@ -570,8 +570,8 @@ def test_advisor_tools_verify_a_claim(ctx, monkeypatch):
     assert verifying, "tool output must feed the review"
     assert dispatched == ["read_file"]
     state = runtime._get_state("s1", create=False)
-    assert state.verifiers["claims"].pending is not None
-    assert state.verifiers["claims"].pending["severity"] == "caution"
+    assert state.verifiers["claims"].pending
+    assert state.verifiers["claims"].pending[-1]["severity"] == "caution"
 
 
 def test_default_tools_grant_applies_without_a_roster(ctx, monkeypatch):
@@ -590,7 +590,7 @@ def test_default_tools_grant_applies_without_a_roster(ctx, monkeypatch):
     _turn(ctx)
 
     assert dispatched == ["read_file"], "only the allowlisted tool may run"
-    assert _default(runtime._get_state("s1", create=False)).pending is not None
+    assert _default(runtime._get_state("s1", create=False)).pending
 
 
 def test_advisor_tools_off_by_default(ctx, monkeypatch):
@@ -852,8 +852,8 @@ def test_empty_response_retries_then_records(ctx, monkeypatch):
 
     assert attempts["n"] == 2, "an empty response must be retried"
     state = runtime._get_state("s1", create=False)
-    assert _default(state).pending is not None
-    assert _default(state).pending["finding"] == "Retry recovered the review"
+    assert _default(state).pending
+    assert _default(state).pending[-1]["finding"] == "Retry recovered the review"
 
 
 def test_persistent_empty_response_is_logged_and_counted(ctx, monkeypatch):
@@ -968,7 +968,7 @@ def test_escalating_severity_still_delivers(ctx, monkeypatch):
     ctx.llm.next = FakeResult({"severity": "blocker",
                                "finding": "queue bypass", "reasoning": ""})
     _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
-    assert _default(runtime._get_state("s1", create=False)).pending is not None, \
+    assert _default(runtime._get_state("s1", create=False)).pending, \
         "an escalation must survive dedupe"
 
 
@@ -1221,7 +1221,7 @@ def test_truncated_response_is_surfaced_not_silently_dropped(ctx, monkeypatch):
 
     state = runtime._get_state("s1", create=False)
     assert state.last_error, "a truncated response must surface an error"
-    assert _default(state).pending is None
+    assert not _default(state).pending
 
 
 def test_schema_accepts_response_without_reasoning(ctx, monkeypatch):

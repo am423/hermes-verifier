@@ -127,8 +127,10 @@ def _status_lines() -> List[str]:
                 models.append(stats["model"])
         pending = ""
         for slug, verifier in sorted(verifiers.items()):
-            if verifier.get("pending"):
-                pending = f" | pending: {verifier['pending']['severity']} ({slug})"
+            latest = verifier.get("pending_latest")
+            if verifier.get("pending") and latest:
+                pending = (f" | pending: {latest.get('severity', 'note')} "
+                           f"({slug}, {verifier['pending']} queued)")
                 break
         last_err = sess.get("last_error") or ""
         if last_err:
