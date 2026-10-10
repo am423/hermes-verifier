@@ -71,7 +71,7 @@ config_schema:
   semantic_dedupe_threshold:
     type: float
     default: 0.0
-    description: "Suppress a RESTATED finding the exact-text guard missed, when cosine similarity to a recent finding is at least this. 0 = off; 0.30 is the measured operating point (catches 5/5 paraphrases, 0/5 wrongly suppressed). Cosine is NOT a probability. Requires the embedding sidecar; unreachable or below threshold keeps the finding."
+    description: "Suppress a RESTATED finding when cosine similarity to a recent finding is at least this. 0 = off (SHIPPED DEFAULT -- do not enable without validating on your own findings). UNVALIDATED: the 0.30 figure was fit on unrelated negative pairs, but same-session findings share file names and identifiers and score 0.29-0.81, overlapping the paraphrase range 0.59-0.78. No threshold cleanly separates them, so enabling this WILL over-suppress distinct findings. Cosine is not a probability."
   semantic_dedupe_url:
     type: str
     default: "http://127.0.0.1:8766/similarity"
