@@ -50,20 +50,21 @@ const SEVERITY_STYLE = {
 function SeverityChip({ severity }) {
   if (!severity) return null
   const style = SEVERITY_STYLE[severity] || SEVERITY_STYLE.note
-  return jsx(
-    'span',
-    {
-      style: {
-        ...style,
-        border: '1px solid var(--ui-stroke-secondary)',
-        borderRadius: '4px',
-        padding: '0 6px',
-        fontSize: '0.6875rem',
-        lineHeight: '1.4',
-      },
+  // `severity` belongs in children, not as the third argument: in this file the
+  // third argument of jsx()/jsxs() is the React KEY (see the sibling
+  // components, which all pass text via `children:`). Passing it positionally
+  // gave the span a key and no content, so every severity chip rendered empty.
+  return jsx('span', {
+    style: {
+      ...style,
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '4px',
+      padding: '0 6px',
+      fontSize: '0.6875rem',
+      lineHeight: '1.4',
     },
-    severity
-  )
+    children: severity,
+  })
 }
 
 function FindingCard({ record }) {
@@ -203,6 +204,26 @@ function VerifierBar({ ctx }) {
     retry: 1,
   })
 
+  // ALL hooks run before any conditional return. The early return below used to
+  // sit ABOVE this useCallback, so the hook count changed the moment Verifier
+  // Mode opened and React threw "Rendered more hooks than during the previous
+  // render".
+  const onSelectModel = useCallback(
+    async (next) => {
+      try {
+        const res = await ctx.rest('/model', { method: 'PUT', body: { model: next } })
+        if (!res || res.ok === false) throw new Error((res && res.error) || 'failed')
+        haptic('tap')
+        qc.invalidateQueries({ queryKey: ['hermes-verifier', 'state'] })
+        return true
+      } catch (error) {
+        host.notifyError(error, 'Could not set the verifier model')
+        return false
+      }
+    },
+    [ctx, qc]
+  )
+
   const sid = vsessionQuery.data && vsessionQuery.data.session_id
   if (!sid || focusedStoredId !== sid) return null
 
@@ -223,22 +244,6 @@ function VerifierBar({ ctx }) {
   } else if (!enabled) {
     chipText = 'paused'
   }
-
-  const onSelectModel = useCallback(
-    async (next) => {
-      try {
-        const res = await ctx.rest('/model', { method: 'PUT', body: { model: next } })
-        if (!res || res.ok === false) throw new Error((res && res.error) || 'failed')
-        haptic('tap')
-        qc.invalidateQueries({ queryKey: ['hermes-verifier', 'state'] })
-        return true
-      } catch (error) {
-        host.notifyError(error, 'Could not set the verifier model')
-        return false
-      }
-    },
-    [ctx, qc]
-  )
 
   return jsxs('div', {
     className: 'flex items-center gap-2',
