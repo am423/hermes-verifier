@@ -201,7 +201,16 @@ class SessionVerifier:
         for entry in roster:
             slug = str(entry.get("slug") or entry.get("name"))
             if not entry.get("enabled", True):
-                self.verifiers.pop(slug, None)
+                # "default" is the RESERVED slug of the built-in verifier, which
+                # this method guarantees exists (see entries.add above). A roster
+                # entry mapping onto it -- e.g. one literally named "Default"
+                # with enabled: false -- must not be able to delete it. Doing so
+                # left the session with NO verifiers, and the next _sync_roster
+                # dereferenced verifiers["default"], raised KeyError, and had it
+                # swallowed by the post-hook's broad except: no review, no event,
+                # last_error empty. Every turn went silently unreviewed.
+                if slug != DEFAULT_VERIFIER:
+                    self.verifiers.pop(slug, None)
                 continue
             verifier = self.verifiers.get(slug)
             if verifier is None:
@@ -274,8 +283,12 @@ def _sync_roster(state: SessionVerifier) -> None:
         # Same roster shape, but default_tools / advisor_tools may still have moved.
         default_grant = _config(_CTX, "default_tools", []) or []
         resolved = tools_mod.resolve_grant(default_grant)
-        if resolved != state.verifiers[DEFAULT_VERIFIER].tool_grant:
-            state.verifiers[DEFAULT_VERIFIER].tool_grant = resolved
+        # .get() rather than []: the invariant is "the default always exists",
+        # and a future violation of it must degrade to a missing grant, not a
+        # KeyError that the hook's broad except turns into silent no-review.
+        default_verifier = state.verifiers.get(DEFAULT_VERIFIER)
+        if default_verifier is not None and resolved != default_verifier.tool_grant:
+            default_verifier.tool_grant = resolved
 
 
 def bind_ctx(ctx: Any) -> None:
