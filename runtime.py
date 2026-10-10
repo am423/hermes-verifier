@@ -758,10 +758,18 @@ def handle_pre_llm_call(session_id: Any = "", **kwargs: Any) -> Optional[Dict[st
         for verifier in state.verifiers.values():
             verifier.pending = None
     if not pending and not nudge:
+        # A quiet turn still ticks the immunity clock down. Without this the
+        # cooldown could never drain, so one early blocker would mute the
+        # advisor for the rest of the session.
+        state.immunity_left = max(0, state.immunity_left - 1)
         return None
     severities = {f.get("severity", "note") for f in pending.values()}
     if severities & {"caution", "blocker"}:
-        state.immunity_left = int(_config(_CTX, "immunity_turns", 3) or 3)
+        # Only arm the cooldown when it is not already running. Re-arming on
+        # every delivery would make a recurring blocker permanently immune,
+        # because each delivery reset the counter before it could count down.
+        state.immunity_left = max(state.immunity_left,
+                                  int(_config(_CTX, "immunity_turns", 3) or 3))
     else:
         state.immunity_left = max(0, state.immunity_left - 1)
     blocks = [_render_finding(slug, finding) for slug, finding in pending.items()]

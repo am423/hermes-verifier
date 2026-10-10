@@ -162,7 +162,10 @@ def test_full_cycle_raise_and_deliver(ctx, monkeypatch):
     assert '<finding severity="caution"' in injected["context"]
     assert "Bypasses the durable queue" in injected["context"]
     assert runtime.handle_pre_llm_call(session_id="s1") is None
-    assert state.immunity_left == 3
+    # A quiet turn ticks the cooldown down, so the caution armed 3 and the
+    # call above drained one. This is deliberate: without the drain a single
+    # early finding could mute the advisor for the rest of the session.
+    assert state.immunity_left == 2
 
 
 def test_duplicate_suppressed(ctx, monkeypatch):
@@ -967,3 +970,63 @@ def test_escalating_severity_still_delivers(ctx, monkeypatch):
     _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
     assert _default(runtime._get_state("s1", create=False)).pending is not None, \
         "an escalation must survive dedupe"
+
+
+def test_nudge_and_pending_finding_both_delivered(ctx, monkeypatch):
+    """A nudge and a real finding in the same turn must both arrive."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["nudge_first_turns"] = 5
+    ctx.llm.next = FakeResult({"severity": "caution",
+                               "finding": "queue bypass", "reasoning": ""})
+    _turn(ctx)
+    runtime.handle_pre_llm_call(session_id="s1", user_message="m",
+                                conversation_history=[])
+    ctx.llm.next = FakeResult({"severity": "blocker",
+                               "finding": "credential leak", "reasoning": ""})
+    _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
+
+    injected = runtime.handle_pre_llm_call(session_id="s1", user_message="m",
+                                           conversation_history=[])
+    assert injected is not None
+    assert "advisor" in injected["context"].lower(), "the nudge must be present"
+    assert "credential leak" in injected["context"], "the finding must be present"
+
+
+def test_immunity_cooldown_expires(ctx, monkeypatch):
+    """The cooldown counts down on quiet turns instead of muting forever.
+
+    While blockers keep arriving the cooldown legitimately stays armed (that is
+    the rate limit doing its job). It must decrement once findings stop, so a
+    later blocker can steer again.
+    """
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["immunity_turns"] = 2
+
+    # Turn 1: a blocker interrupts and arms the cooldown.
+    ctx.llm.next = FakeResult({"severity": "blocker",
+                               "finding": "first blocker", "reasoning": ""})
+    _turn(ctx)
+    assert runtime.handle_pre_verify(session_id="s1") is not None, \
+        "the first blocker must steer"
+    state = runtime._get_state("s1", create=False)
+    assert state.immunity_left == 2
+
+    # Turns 2-3: quiet turns (severity none) must decrement the cooldown.
+    for i in (2, 3):
+        ctx.llm.next = FakeResult({"severity": "none", "finding": "",
+                                   "reasoning": ""})
+        _turn(ctx, history=[{"role": "user", "content": f"t{i}"}], response=f"a{i}")
+        runtime.handle_pre_llm_call(session_id="s1", user_message="m",
+                                    conversation_history=[])
+    assert state.immunity_left == 0, (
+        f"quiet turns must drain the cooldown, got {state.immunity_left}"
+    )
+
+    # Turn 4: a real blocker must steer again now that immunity expired.
+    # pre_verify runs before pre_llm_call in the real turn lifecycle, so the
+    # blocker must still be pending when the gate looks for it.
+    ctx.llm.next = FakeResult({"severity": "blocker",
+                               "finding": "later blocker", "reasoning": ""})
+    _turn(ctx, history=[{"role": "user", "content": "t4"}], response="a4")
+    assert runtime.handle_pre_verify(session_id="s1") is not None, \
+        "immunity must expire so a real blocker can steer"
