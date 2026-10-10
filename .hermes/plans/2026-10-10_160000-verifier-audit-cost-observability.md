@@ -593,3 +593,23 @@ copy of the plugin. Treat the instruction as advisory and unproven.
   (mean 939, max 1346), costing detail, not the review.
 - Prompt-level budget instructions should not be relied on; the prompt already
   asked for brevity and the model exceeded it ~3x.
+
+### 3b. Prompt-instruction A/B — RESULT: no measurable effect
+
+Four sessions ran with the strengthened "budget your whole reply to about 300
+tokens" instruction. Outcome:
+
+| | findings | mean output tokens | mean words |
+| --- | --- | --- | --- |
+| Baseline (before instruction) | 12 | 939 | ~160 |
+| After instruction | 13 | 931 | ~161 |
+
+**One finding emerged in the A/B window, at 838 tokens / 161 words — inside the
+baseline range.** The instruction produced no measurable reduction, which is
+consistent with the composition data: the model was already within the 200-word
+limit, so there was nothing to squeeze. The instruction was reverted (commit
+`ccf2f56`) and replaced with a grounded one targeting `reasoning` (15.1% of
+output text, diagnostics only).
+
+Caveat: n=1 finding in the window is weak evidence on its own; it is reported as
+consistent with, not proof of, the composition analysis.
