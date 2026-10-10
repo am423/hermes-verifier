@@ -149,6 +149,7 @@ class SessionVerifier:
     backlog: int = 0
     reviewing: bool = False
     consecutive_failures: int = 0
+    empty_responses: int = 0
     last_error: str = ""
     last_review_ts: float = 0.0
     roster_signature: Any = None
@@ -197,6 +198,7 @@ class SessionVerifier:
         self.reviews_used = 0
         self.turns_seen = 0
         self.roster_signature = None
+        self.empty_responses = 0
         for verifier in self.verifiers.values():
             verifier.reset()
 
@@ -508,8 +510,38 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
 
     parsed = getattr(result, "parsed", None)
     if not isinstance(parsed, dict):
-        logger.debug("verifier %s returned non-JSON for %s", verifier.slug, state.session_id)
-        return
+        # An empty completion surfaces as content_type="text" with no payload:
+        # _parse_structured_text returns (None, "text") on an empty body. Retry
+        # once before giving up — a silent empty response must not look like
+        # "no finding", which is exactly how these were being lost.
+        if result is not None and not getattr(result, "text", ""):
+            with _LOCK:
+                state.empty_responses += 1
+            logger.warning(
+                "verifier %s got an empty completion for %s (empty #%d); retrying",
+                verifier.slug, state.session_id, state.empty_responses,
+            )
+            retry = _call_structured(
+                ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
+                input_text=delta_text, provider=provider, model=model, **cap_kwargs,
+            )
+            retry_parsed = getattr(retry, "parsed", None)
+            if isinstance(retry_parsed, dict):
+                result, parsed = retry, retry_parsed
+            else:
+                state.last_error = (
+                    f"empty completion persisted after retry (empty #"
+                    f"{state.empty_responses})"
+                )[:300]
+                publish_event("error", {"session_id": state.session_id,
+                                        "verifier": verifier.slug,
+                                        "error": state.last_error})
+                logger.warning("verifier %s still empty after retry for %s",
+                               verifier.slug, state.session_id)
+                return
+        else:
+            logger.debug("verifier %s returned non-JSON for %s", verifier.slug, state.session_id)
+            return
     severity = str(parsed.get("severity") or "none").strip().lower()
     finding_text = str(parsed.get("finding") or "").strip()
     if severity == "none" or not finding_text:

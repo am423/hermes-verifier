@@ -620,7 +620,10 @@ def test_review_budget_blocks_after_cap(ctx, monkeypatch):
 
     _turn(ctx, history=[{"role": "user", "content": "third"}], response="third")
     assert state.reviews_used == 2, "budget exhausted — no further reviews"
-    assert len(ctx.llm.calls) == 2, "no provider call may be made past the cap"
+    before = len(ctx.llm.calls)
+    _turn(ctx, history=[{"role": "user", "content": "fourth"}], response="fourth")
+    assert len(ctx.llm.calls) == before, "no provider call may be made past the cap"
+    assert state.reviews_used == 2
 
 
 def test_review_budget_unlimited_by_default(ctx, monkeypatch):
@@ -816,3 +819,63 @@ def test_dashboard_state_exposes_new_settings():
     assert s["max_reviews_per_session"] == 7
     assert s["advisor_max_tokens"] == 1024
     assert s["nudge_first_turns"] == 2
+
+
+# ── Empty advisor response: retry + observability ────────────────────────────
+
+
+def test_empty_response_retries_then_records(ctx, monkeypatch):
+    """An empty provider completion (content_type=text, tokens=0) is retried.
+
+    Root cause: _parse_structured_text returns (None, "text") on an empty body,
+    so a silent empty completion looked like "no finding" and was dropped with
+    only a debug line. The review now retries and records the outcome.
+    """
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    attempts = {"n": 0}
+
+    class FlakyLlm:
+        def complete_structured(self, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                # Empty completion: no parsed payload, no text.
+                return FakeResult(None, text="")
+            return FakeResult({"severity": "caution",
+                               "finding": "Retry recovered the review",
+                               "reasoning": "second attempt"})
+
+    ctx.llm.complete_structured = FlakyLlm().complete_structured
+    _turn(ctx)
+
+    assert attempts["n"] == 2, "an empty response must be retried"
+    state = runtime._get_state("s1", create=False)
+    assert _default(state).pending is not None
+    assert _default(state).pending["finding"] == "Retry recovered the review"
+
+
+def test_persistent_empty_response_is_logged_and_counted(ctx, monkeypatch):
+    """A review that stays empty is recorded as an outcome, not silently lost."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.complete_structured = lambda **kw: FakeResult(None, text="")
+
+    _turn(ctx)
+
+    state = runtime._get_state("s1", create=False)
+    v = _default(state)
+    assert state.empty_responses >= 1, "empty completions must be counted"
+    assert state.last_error, "an unrecovered empty response must be surfaced"
+    assert v.stats["reviews"] >= 1, "the attempts must still count as reviews"
+
+
+def test_no_retry_when_a_real_finding_returns(ctx, monkeypatch):
+    """A good first response must not trigger a retry."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    calls = {"n": 0}
+
+    def _ok(**kw):
+        calls["n"] += 1
+        return FakeResult({"severity": "note", "finding": "fine", "reasoning": ""})
+
+    ctx.llm.complete_structured = _ok
+    _turn(ctx)
+    assert calls["n"] == 1
