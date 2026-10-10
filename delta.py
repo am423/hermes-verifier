@@ -10,7 +10,6 @@ Pure stdlib: unit-testable in isolation.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -194,8 +193,3 @@ def extract_delta(
                 if tail_len > 0 else f"{tail[:head]}{marker}")
     return new_cursor, tail
 
-
-def user_anchor(user_message: Any) -> str:
-    """Stable short hash of the current user message (compaction detection)."""
-    text = _content_to_text(user_message)
-    return hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()[:16]

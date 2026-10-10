@@ -110,10 +110,6 @@ def test_extract_delta_truncation_marker():
     assert "… [delta truncated]" in text
 
 
-def test_user_anchor_stable():
-    assert delta.user_anchor("same message") == delta.user_anchor("same message")
-    assert delta.user_anchor("same message") != delta.user_anchor("other")
-
 
 def test_tool_call_args_are_truncated_tighter():
     """Tool-call args echo inflates the delta; the advisor needs intent, not payload.

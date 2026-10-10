@@ -172,7 +172,12 @@ def _dump_lines(raw: bool, limit: int = 12) -> List[str]:
     shown = 0
     for path in files[:4]:
         session = path.stem[len("verify."):]
-        marker = " ←" if session == runtime._slug_session(recent or "") else ""
+        # The stem is "<session>.<slug>", so comparing the whole stem against a
+        # bare session slug never matched and the ← marker was dead in every
+        # case. Compare only the session part.
+        session_part = session.partition(".")[0]
+        marker = (" ←" if session_part == runtime._slug_session(recent or "")
+                  else "")
         lines.append(f"  {session}{marker}")
         try:
             tail = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-limit:]

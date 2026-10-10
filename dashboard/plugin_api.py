@@ -347,7 +347,13 @@ async def events_ws(websocket: WebSocket) -> None:
                 try:
                     requested = int(json.loads(message or "{}").get("seq", client_seq))
                     client_seq = max(client_seq, requested)
-                except (ValueError, json.JSONDecodeError):
+                except (ValueError, TypeError, AttributeError,
+                        json.JSONDecodeError):
+                    # A frame that is not an object (`[]`) raises AttributeError on
+                    # .get, and a null seq raises TypeError on int(None). Neither
+                    # was caught, so a single malformed client frame propagated
+                    # out of the loop and killed the events socket for the whole
+                    # dashboard rather than being ignored.
                     pass
             except (asyncio.TimeoutError, WebSocketDisconnect):
                 pass
