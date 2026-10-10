@@ -852,6 +852,7 @@ def snapshot() -> Dict[str, Any]:
                 "active": subsystem_enabled(st.session_id),
                 "reviewing": st.reviewing,
                 "backlog": st.backlog,
+                "reviews_used": st.reviews_used,
                 "immunity_left": st.immunity_left,
                 "last_error": st.last_error,
                 "verifiers": verifiers,

@@ -696,3 +696,22 @@ def test_nudge_counts_turns_even_when_subsystem_off(ctx):
     injected = runtime.handle_pre_llm_call(
         session_id="s1", user_message="m", conversation_history=[])
     assert injected is not None, "second turn is still inside the nudge window"
+
+
+# ── Status surfacing ─────────────────────────────────────────────────────────
+
+
+def test_status_lines_surface_new_controls(ctx):
+    from verifier_pkg import commands
+    ctx.config.update({"max_reviews_per_session": 5, "advisor_tools": True,
+                       "nudge_first_turns": 2})
+    text = "\n".join(commands._status_lines())
+    assert "advisor tools: on" in text
+    assert "nudge: first 2" in text
+    assert "review budget: 5" in text
+
+
+def test_status_budget_unlimited_by_default(ctx):
+    from verifier_pkg import commands
+    text = "\n".join(commands._status_lines())
+    assert "review budget: unlimited" in text

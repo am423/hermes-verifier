@@ -29,7 +29,9 @@ Subcommands:
   dump [raw]     Recent accepted findings. 'raw' includes private reasoning.
 
 Config (plugins.entries.hermes-verifier.settings):
-  enabled, model, sync_backlog, immunity_turns, max_delta_chars, blocker_steer
+  enabled, verifier_model, sync_backlog, immunity_turns, max_delta_chars,
+  blocker_steer, advisor_tools, default_tools, max_reviews_per_session,
+  advisor_max_tokens, nudge_first_turns
 
 Model override requires plugins.entries.hermes-verifier.llm.allow_model_override:
 true (or the llm.model_override capability grant).
@@ -49,6 +51,15 @@ def _status_lines() -> List[str]:
     default_enabled = bool(runtime._config(cfg, "enabled", False))
     model_cfg = str(runtime._config(cfg, "verifier_model", "") or "").strip() or "(primary model)"
     lines.append(f"[hermes-verifier] config default: {'on' if default_enabled else 'off'} | model: {model_cfg}")
+    budget_cap = int(runtime._config(cfg, "max_reviews_per_session", 0) or 0)
+    tools_on = bool(runtime._config(cfg, "advisor_tools", False))
+    nudge_turns = int(runtime._config(cfg, "nudge_first_turns", 0) or 0)
+    cap_label = str(budget_cap) if budget_cap else "unlimited"
+    nudge_label = f"first {nudge_turns}" if nudge_turns else "off"
+    lines.append(
+        f"  advisor tools: {'on' if tools_on else 'off'} | nudge: {nudge_label}"
+        f" | review budget: {cap_label}"
+    )
 
     sessions = snap["sessions"]
     if not sessions:
@@ -78,12 +89,14 @@ def _status_lines() -> List[str]:
         last_err = sess.get("last_error") or ""
         if last_err:
             last_err = f" | error: {last_err[:80]}"
+        used = sess.get("reviews_used", 0) or 0
+        budget_seg = f" | budget: {used}/{cap_label}" if budget_cap else ""
         line = (
             f"  {sess['session_id'][:28]:<28} {active} | reviews: {agg['reviews']} "
             f"| findings: {agg['findings']} (n:{agg['notes']} "
             f"c:{agg['cautions']} b:{agg['blockers']}) "
             f"| tokens: {agg['input_tokens'] + agg['output_tokens']} "
-            f"| cost: {_fmt_cost(agg['cost_usd'])}"
+            f"| cost: {_fmt_cost(agg['cost_usd'])}{budget_seg}"
         )
         lines.append(line + reviewing + pending + last_err)
         if models:
