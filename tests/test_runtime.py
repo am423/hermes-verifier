@@ -1080,3 +1080,16 @@ def test_session_eviction_is_bounded():
     finally:
         runtime._SESSIONS.clear()
         runtime._SESSIONS.update(original)
+
+
+def test_status_surfaces_engagement_counters(ctx, monkeypatch):
+    """/verify status must show whether the advisor is actually engaging."""
+    from verifier_pkg import commands
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.next = FakeResult({"severity": "note", "finding": "a real nit",
+                               "reasoning": ""})
+    _turn(ctx)
+
+    text = "\n".join(commands._status_lines())
+    assert "engagement:" in text, "the engagement line must be present"
+    assert "1 review(s)" in text, f"expected 1 review, got:\n{text}"

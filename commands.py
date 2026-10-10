@@ -60,6 +60,18 @@ def _status_lines() -> List[str]:
         f"  advisor tools: {'on' if tools_on else 'off'} | nudge: {nudge_label}"
         f" | review budget: {cap_label}"
     )
+    # Engagement counters: a non-zero review count proves the advisor is
+    # actually running; a rising empty count means it is not answering.
+    if snap["sessions"]:
+        total_reviews = sum(
+            (s.get("verifiers") or {}).get("default", {}).get("stats", {}).get("reviews", 0)
+            for s in snap["sessions"].values()
+        )
+        total_empty = sum(s.get("empty_responses", 0)
+                          for s in snap["sessions"].values())
+        lines.append(
+            f"  engagement: {total_reviews} review(s), {total_empty} empty response(s)"
+        )
 
     sessions = snap["sessions"]
     if not sessions:
