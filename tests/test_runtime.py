@@ -936,3 +936,34 @@ def test_failure_streak_releases_backlog_wait(ctx, monkeypatch):
                         lambda s: clock.__setitem__("t", clock["t"] + s))
     runtime._backlog_wait(state, 1)
     assert clock["t"] == 0, "a failing verifier must never stall the session"
+
+
+def test_identical_finding_not_raised_on_consecutive_turns(ctx, monkeypatch):
+    """The same finding must not re-fire every turn — that is nagging."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    for i in range(3):
+        ctx.llm.next = FakeResult({"severity": "caution",
+                                   "finding": "Bypasses the durable queue in src/jobs",
+                                   "reasoning": "same issue"})
+        _turn(ctx, history=[{"role": "user", "content": f"t{i}"}], response=f"a{i}")
+        runtime.handle_pre_llm_call(session_id="s1", user_message="m",
+                                    conversation_history=[])
+    stats = _default(runtime._get_state("s1", create=False)).guard.stats
+    assert stats["deduped"] >= 2, (
+        f"identical findings must be deduped across turns, got {stats}"
+    )
+
+
+def test_escalating_severity_still_delivers(ctx, monkeypatch):
+    """A note escalating to a blocker is new information, not a duplicate."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.next = FakeResult({"severity": "note",
+                               "finding": "queue bypass", "reasoning": ""})
+    _turn(ctx)
+    runtime.handle_pre_llm_call(session_id="s1", user_message="m",
+                                conversation_history=[])
+    ctx.llm.next = FakeResult({"severity": "blocker",
+                               "finding": "queue bypass", "reasoning": ""})
+    _turn(ctx, history=[{"role": "user", "content": "t2"}], response="a2")
+    assert _default(runtime._get_state("s1", create=False)).pending is not None, \
+        "an escalation must survive dedupe"
