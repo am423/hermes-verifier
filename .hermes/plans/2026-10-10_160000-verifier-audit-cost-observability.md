@@ -613,3 +613,38 @@ output text, diagnostics only).
 
 Caveat: n=1 finding in the window is weak evidence on its own; it is reported as
 consistent with, not proof of, the composition analysis.
+
+### 3c. Statistics corrected — and the correction's proposed fix also fails
+
+Two errors in the earlier determination, plus one in the correction.
+
+**Retracted: "r²=0.63 → 37% unexplained… supports hidden reasoning."**
+Share of *variance* is not share of *tokens*. Unexplained variance says nothing
+about what fraction of billed tokens is hidden. The claim is withdrawn.
+
+**Retracted: the intercept as a hidden-cost estimate.**
+The proposed fix was to read the regression intercept as the fixed/hidden
+component. Measured across subsets, it does not hold:
+
+| Subset | n | slope (tok/char) | intercept (tok) |
+| --- | --- | --- | --- |
+| all | 15 | 0.932 | **−218** |
+| exclude o<400 | 14 | 0.596 | +234 |
+| o<1100 | 12 | 0.824 | −130 |
+| first 8 | 8 | 0.277 | **+665** |
+| last 8 | 8 | 1.051 | **−404** |
+
+The slope swings ~4x and the intercept flips sign. A negative intercept is
+unphysical, and an estimate that flips sign across subsets cannot support a
+claim about hidden tokens. **The linear model is not stably estimable from these
+rows** — they vary in prompt content and session, so the fit is confounded.
+
+**Also withdrawn: the reasoning-trim saving.** It was 15% from composition
+shares; recomputing from the marginal slope gives 7% (at slope 0.361) or 18% (at
+0.932). Since the slope is not stable, neither figure is defensible.
+
+**What would actually settle it:** a controlled A/B — the same review content
+with and without the `reasoning` field in the schema — so the only variable is
+the field. The prompt-instruction A/B (3b) was not controlled this way.
+
+**Nothing in this addendum should be used to size a cost-saving change.**
