@@ -26,6 +26,8 @@ logger = logging.getLogger("hermes-verifier")
 
 def register(ctx) -> None:
     """Wire hooks and the slash command. Called once at plugin load."""
+    import atexit
+
     from . import commands, runtime
 
     runtime.bind_ctx(ctx)
@@ -41,5 +43,11 @@ def register(ctx) -> None:
         description="Control the session verifier: status, on/off, reset, dump.",
         args_hint="[on|off|status|reset|dump]",
     )
+
+    # Reviews run on daemon threads, so a short-lived process (`hermes chat -q`)
+    # would otherwise kill them at exit along with their telemetry. atexit runs
+    # before daemon threads are reaped, so this is the one chance to wait.
+    atexit.register(runtime.drain_reviews, runtime._DRAIN_TIMEOUT)
+
     logger.info("hermes-verifier registered (subsystem default: %s)",
                 bool(ctx.get_config("enabled", False)))

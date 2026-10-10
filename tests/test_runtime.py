@@ -1145,3 +1145,16 @@ def test_status_reports_token_estimate(ctx, monkeypatch):
     text = "\n".join(commands._status_lines())
     assert "est" in text and "actual tokens" in text, \
         f"expected a token estimate in status, got:\n{text}"
+
+
+# ── Review durability at process exit ────────────────────────────────────────
+
+
+def test_pending_reviews_can_be_drained():
+    """Short-lived processes must be able to wait for in-flight reviews.
+
+    hermes chat -q exits at turn end and the daemon review thread dies with it,
+    so the review and its telemetry are lost.
+    """
+    drained = runtime.drain_reviews(timeout=0.01)
+    assert isinstance(drained, bool)

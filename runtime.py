@@ -80,6 +80,14 @@ _INFLIGHT = threading.BoundedSemaphore(_MAX_INFLIGHT)
 _BACKLOG_WAIT_CAP = 30.0
 _BACKLOG_POLL = 0.1
 
+# In-flight review threads, so a short-lived process can wait for them at exit.
+# Review threads are daemon threads (they must never block a normal exit), which
+# means `hermes chat -q` kills them at turn end and the review plus its
+# telemetry are lost. drain_reviews() is the explicit, bounded join.
+_THREADS_LOCK = threading.Lock()
+_ACTIVE_REVIEWS: "set" = set()
+_DRAIN_TIMEOUT = 20.0
+
 # Event log for the dashboard websocket + UI: bounded ring with sequence ids.
 EVENT_LOG: "List[Dict[str, Any]]" = []
 _EVENT_SEQ = 0
@@ -591,6 +599,8 @@ def _run_review(state: SessionVerifier, delta_text: str) -> None:
             publish_event("review_finished", {"session_id": state.session_id})
     finally:
         _INFLIGHT.release()
+        with _THREADS_LOCK:
+            _ACTIVE_REVIEWS.discard(threading.current_thread())
 
 
 def _schedule_review(state: SessionVerifier, delta_text: str) -> None:
@@ -613,7 +623,30 @@ def _schedule_review(state: SessionVerifier, delta_text: str) -> None:
         target=_run_review, args=(state, delta_text),
         name=f"hermes-verifier:{state.session_id[:24]}", daemon=True,
     )
+    with _THREADS_LOCK:
+        _ACTIVE_REVIEWS.add(thread)
     thread.start()
+
+
+def drain_reviews(timeout: float = _DRAIN_TIMEOUT) -> bool:
+    """Wait briefly for in-flight reviews so a short-lived process does not
+    kill them. Returns True when everything finished within the timeout.
+
+    Review threads are daemons so they never block a normal exit; this is called
+    explicitly at process teardown and is always bounded.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        with _THREADS_LOCK:
+            pending = [t for t in _ACTIVE_REVIEWS if t.is_alive()]
+        if not pending:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning("drain_reviews timed out with %d review(s) in flight",
+                           len(pending))
+            return False
+        pending[0].join(timeout=min(0.1, remaining))
 
 
 # ---------------------------------------------------------------------------
