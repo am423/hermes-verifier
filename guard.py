@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import OrderedDict
-from typing import Dict, Optional
+from typing import Dict
 
 SEVERITY_RANK: Dict[str, int] = {"note": 1, "caution": 2, "blocker": 3}
 

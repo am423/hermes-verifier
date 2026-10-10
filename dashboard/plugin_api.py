@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -120,7 +119,6 @@ def _transcript_from_disk(session_id: Optional[str], limit: int) -> List[Dict[st
     data_dir = _data_dir()
     if not data_dir.is_dir():
         return []
-    pattern = re.compile(r"^verify\..*\.jsonl$")
     files = sorted(data_dir.glob("verify.*.jsonl"), key=lambda p: p.stat().st_mtime,
                    reverse=True)
     if session_id:

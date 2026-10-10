@@ -14,8 +14,7 @@ the most recently active primary session the hooks have seen.
 from __future__ import annotations
 
 import json
-import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, List, Optional
 
 from . import gate as gate_mod
 from . import runtime
@@ -165,7 +164,6 @@ def _dump_lines(raw: bool, limit: int = 12) -> List[str]:
     if not data_dir.is_dir():
         return ["  No verifier transcripts yet."]
     recent = runtime.recent_session()
-    pattern = re.compile(r"^verify\..*\.jsonl$")
     files = sorted(data_dir.glob("verify.*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
         return ["  No verifier transcripts yet."]
