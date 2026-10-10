@@ -38,6 +38,15 @@ logger = logging.getLogger("hermes-verifier")
 PLUGIN_ID = "hermes-verifier"
 DEFAULT_VERIFIER = "default"
 
+# Claude Code found a turn-2 consultation reminder raised Haiku pass rates by
+# ~7pp, had no measurable effect on Sonnet, and slightly lowered Opus rates.
+# Ported with that caveat attached, and off by default.
+NUDGE_TEXT = (
+    "You have an independent advisor available. Before committing to an approach "
+    "for this task, consider consulting it — it is most useful for non-obvious "
+    "design decisions and failure modes you have not yet ruled out."
+)
+
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
@@ -144,6 +153,7 @@ class SessionVerifier:
     last_review_ts: float = 0.0
     roster_revision: int = 0
     reviews_used: int = 0
+    turns_seen: int = 0
 
     def ensure_verifiers(self, roster: List[Dict[str, Any]]) -> None:
         """Rebuild the verifier list when the roster changes."""
@@ -185,6 +195,7 @@ class SessionVerifier:
         self.backlog = 0
         self.reviewing = False
         self.reviews_used = 0
+        self.turns_seen = 0
         for verifier in self.verifiers.values():
             verifier.reset()
 
@@ -662,18 +673,32 @@ def handle_post_llm_call(
 
 
 def handle_pre_llm_call(session_id: Any = "", **kwargs: Any) -> Optional[Dict[str, str]]:
-    """Deliver pending findings into the next primary turn's context."""
-    if not subsystem_enabled(session_id):
+    """Deliver pending findings into the next primary turn's context.
+
+    Also drives the optional first-turn nudge. The nudge goes through
+    ``pre_llm_call`` rather than the system prompt so the cached prefix is
+    preserved — injecting into the user message is the documented cache-safe
+    path.
+    """
+    state = _get_state(session_id)
+    if state is None:  # pragma: no cover - create=True above
         return None
-    state = _get_state(session_id, create=False)
-    if state is None:
+    # The nudge window tracks real turns even when the subsystem is off, so
+    # enabling it mid-session does not restart the count.
+    nudge_turns = int(_config(_CTX, "nudge_first_turns", 0) or 0)
+    nudge = None
+    with _LOCK:
+        if nudge_turns and state.turns_seen < nudge_turns:
+            nudge = NUDGE_TEXT
+        state.turns_seen += 1
+    if not subsystem_enabled(session_id):
         return None
     with _LOCK:
         pending = {slug: v.pending for slug, v in state.verifiers.items()
                    if v.pending is not None}
         for verifier in state.verifiers.values():
             verifier.pending = None
-    if not pending:
+    if not pending and not nudge:
         return None
     severities = {f.get("severity", "note") for f in pending.values()}
     if severities & {"caution", "blocker"}:
@@ -681,6 +706,8 @@ def handle_pre_llm_call(session_id: Any = "", **kwargs: Any) -> Optional[Dict[st
     else:
         state.immunity_left = max(0, state.immunity_left - 1)
     blocks = [_render_finding(slug, finding) for slug, finding in pending.items()]
+    if nudge:
+        blocks.insert(0, nudge)
     return {"context": "\n\n".join(blocks)}
 
 

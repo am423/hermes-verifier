@@ -654,3 +654,45 @@ def test_budget_counts_attempts_not_successes(ctx, monkeypatch):
     state = runtime._get_state("s1", create=False)
     assert state.reviews_used == 1
     assert state.consecutive_failures == 1
+
+
+# ── First-turn advisor nudge ─────────────────────────────────────────────────
+
+
+def test_nudge_injected_on_early_turns(ctx):
+    ctx.config["nudge_first_turns"] = 2
+    injected = runtime.handle_pre_llm_call(
+        session_id="s1", user_message="build the thing",
+        conversation_history=[], is_first_turn=True)
+    assert injected is not None
+    assert "advisor" in injected["context"].lower()
+
+
+def test_nudge_not_injected_when_disabled(ctx):
+    ctx.config["nudge_first_turns"] = 0
+    assert runtime.handle_pre_llm_call(
+        session_id="s1", user_message="build the thing",
+        conversation_history=[], is_first_turn=True) is None
+
+
+def test_nudge_stops_after_n_turns(ctx):
+    ctx.config["nudge_first_turns"] = 1
+    for _ in range(3):
+        runtime.handle_pre_llm_call(session_id="s1", user_message="m",
+                                    conversation_history=[])
+    assert runtime.handle_pre_llm_call(
+        session_id="s1", user_message="m", conversation_history=[]) is None
+
+
+def test_nudge_counts_turns_even_when_subsystem_off(ctx):
+    """The nudge window tracks real turns regardless of the enable state."""
+    ctx.config["nudge_first_turns"] = 2
+    ctx.config["enabled"] = False
+    assert runtime.handle_pre_llm_call(
+        session_id="s1", user_message="m", conversation_history=[]) is None
+    state = runtime._get_state("s1", create=False)
+    assert state.turns_seen == 1
+    ctx.config["enabled"] = True
+    injected = runtime.handle_pre_llm_call(
+        session_id="s1", user_message="m", conversation_history=[])
+    assert injected is not None, "second turn is still inside the nudge window"
