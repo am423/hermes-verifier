@@ -879,3 +879,30 @@ def test_no_retry_when_a_real_finding_returns(ctx, monkeypatch):
     ctx.llm.complete_structured = _ok
     _turn(ctx)
     assert calls["n"] == 1
+
+
+# ── Production readiness: engagement conditions ──────────────────────────────
+
+
+def test_empty_delta_does_not_review(ctx, monkeypatch):
+    """No new transcript content means no paid provider call."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    _turn(ctx, history=[], response="")
+    assert ctx.llm.calls == [], "an empty delta must not spend a provider call"
+
+
+def test_identical_consecutive_turns_do_not_review(ctx, monkeypatch):
+    """A turn that adds no history rows must not re-review old content.
+
+    The cursor tracks row count, so a replayed transcript with no new rows
+    yields an empty delta and therefore no paid provider call. (A turn that
+    genuinely repeats content still warrants review — that is the guard's job,
+    not the cursor's.)
+    """
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    hist = [{"role": "assistant", "content": "same"}]
+    _turn(ctx, history=hist, response="")
+    first = len(ctx.llm.calls)
+    # Replay the identical history with no assistant response: no new rows.
+    _turn(ctx, history=hist, response="")
+    assert len(ctx.llm.calls) == first, "no new delta → no second review"
