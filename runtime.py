@@ -523,14 +523,6 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
     verifier.stats["model"] = getattr(result, "model", "") or ""
     verifier.stats["reviews"] += 1
 
-    # Record what actually went to the provider so cost can be attributed to a
-    # real component (system prompt vs instructions vs delta) instead of guessed.
-    verifier.stats.setdefault("prompt_parts", {
-        "system_prompt": len(system_prompt),
-        "instructions": len(brief.REVIEW_TASK),
-        "transcript": len(transcript),
-    })
-
     parsed = getattr(result, "parsed", None)
     if not isinstance(parsed, dict):
         # Non-empty but unparseable, or still empty after the in-loop retry.
