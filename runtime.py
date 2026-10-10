@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from . import advisor_tools as tools_mod
 from . import brief, delta as delta_mod, guard as guard_mod
+from . import gate as gate_mod
 from . import dedupe as dedupe_mod
 
 logger = logging.getLogger("hermes-verifier")
@@ -104,6 +105,9 @@ _CTX: Any = None
 # Injectable overrides for tests.
 _DATA_DIR_OVERRIDE: Optional[Path] = None
 _REVIEW_FN_OVERRIDE: Optional[Callable] = None
+
+# Test seam: replaces the engagement decision so tests never spend a model call.
+_GATE_FN_OVERRIDE: Optional[Callable] = None
 _ROSTER_OVERRIDE: Optional[List[Dict[str, Any]]] = None
 _RUNTIME_OVERRIDES: Dict[str, Any] = {}  # /verify on|off session-scoped toggles
 _RECENT_SESSION: Optional[str] = None
@@ -172,6 +176,9 @@ class SessionVerifier:
     roster_signature: Any = None
     reviews_used: int = 0
     turns_seen: int = 0
+    last_gate: Any = None
+    gate_checked: int = 0
+    gate_skipped: int = 0
 
     def ensure_verifiers(self, roster: List[Dict[str, Any]]) -> None:
         """Rebuild the verifier list when the roster changes."""
@@ -457,7 +464,8 @@ def _plugin_llm_trust_error_type() -> Any:
         return None
 
 
-def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> None:
+def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
+                effort: str = "deep") -> None:
     ctx = _CTX
     if ctx is None:
         return
@@ -475,6 +483,12 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
             if block:
                 system_prompt = f"{system_prompt}\n\n{block}"
         cap = int(_config(ctx, "advisor_max_tokens", 0) or 0)
+        if effort == "routine":
+            # The gate judged this turn trivial. Hold the review to a smaller
+            # output budget -- but never below 1024, the measured floor under which
+            # a response is truncated mid-JSON and the whole review is lost.
+            routine_cap = int(_config(ctx, "advisor_routine_tokens", 1024) or 1024)
+            cap = min(cap, routine_cap) if cap else routine_cap
         cap_kwargs = {"max_tokens": cap} if cap >= 1024 else {}
         transcript = delta_text
         result = None
@@ -635,8 +649,26 @@ def _run_review(state: SessionVerifier, delta_text: str) -> None:
             state.reviewing = True
         publish_event("review_started", {"session_id": state.session_id})
         try:
+            decision = _gate_decision(state, delta_text)
+            with _LOCK:
+                state.last_gate = decision
+                state.gate_checked += 1
+                if not decision.engage:
+                    state.gate_skipped += 1
+            publish_event("gate_decided", {
+                "session_id": state.session_id,
+                "engage": decision.engage,
+                "effort": decision.tier,
+                "source": decision.source,
+            })
+            # A skip ends the cycle here, before any verifier call is paid for.
+            # The backlog decrement in the finally block still runs, because the
+            # delta has been consumed either way.
+            if not decision.engage:
+                logger.debug("gate skipped %s (%s)", state.session_id, decision.source)
+                return
             for verifier in state.enabled_verifiers():
-                _review_one(state, verifier, delta_text)
+                _review_one(state, verifier, delta_text, effort=decision.tier)
         finally:
             with _LOCK:
                 state.reviewing = False
@@ -646,6 +678,31 @@ def _run_review(state: SessionVerifier, delta_text: str) -> None:
         _INFLIGHT.release()
         with _THREADS_LOCK:
             _ACTIVE_REVIEWS.discard(threading.current_thread())
+
+
+def _gate_decision(state: SessionVerifier, delta_text: str) -> "gate_mod.GateDecision":
+    """Run the engagement gate, or the test override.
+
+    Costs one cheap call (~180 input tokens measured, against ~9,500 for the
+    review it can avoid). Off by default so an existing install is unchanged;
+    when off this returns an unconditional engage with no model call at all.
+    """
+    if _GATE_FN_OVERRIDE is not None:
+        return _GATE_FN_OVERRIDE(state, delta_text)
+    if not _config(_CTX, "gate_enabled", False):
+        return gate_mod.GateDecision(engage=True, effort="deep", source="disabled")
+    provider, model = _resolve_model_for(_CTX, state.enabled_verifiers()[0]) \
+        if state.enabled_verifiers() else (None, None)
+    try:
+        return gate_mod.decide(
+            _CTX,
+            digest=gate_mod.digest_from_delta(delta_text),
+            provider=provider,
+            model=model,
+        )
+    except Exception as exc:  # decide() does not raise, but never risk a review on this
+        logger.warning("gate error for %s: %s", state.session_id, exc)
+        return gate_mod.FAIL_SAFE
 
 
 def _schedule_review(state: SessionVerifier, delta_text: str) -> None:
@@ -1017,6 +1074,12 @@ def snapshot() -> Dict[str, Any]:
                 "reviewing": st.reviewing,
                 "backlog": st.backlog,
                 "reviews_used": st.reviews_used,
+                "gate_checked": st.gate_checked,
+                "gate_skipped": st.gate_skipped,
+                "last_gate": ({"engage": st.last_gate.engage,
+                               "effort": st.last_gate.tier,
+                               "source": st.last_gate.source}
+                              if st.last_gate is not None else None),
                 "immunity_left": st.immunity_left,
                 "last_error": st.last_error,
                 "verifiers": verifiers,

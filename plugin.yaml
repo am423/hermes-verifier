@@ -60,6 +60,14 @@ config_schema:
     type: int
     default: 0
     description: "Hard cap on advisor reviews per session; 0 = unlimited. Mirrors Claude Code's max_uses cost control."
+  gate_enabled:
+    type: bool
+    default: false
+    description: "Let a cheap model call decide whether each turn gets reviewed at all, and at what effort. Measured at ~180 input tokens per decision against ~9,500 for the review it can skip, and validated on 44 labelled cases with 0 dangerous actions skipped. FAIL-SAFE: any error, timeout, empty or unparseable reply engages the review at deep effort. Off by default."
+  advisor_routine_tokens:
+    type: int
+    default: 1024
+    description: "Output-token budget for a review the gate tiered 'routine'. Never applied below 1024: under that floor a response truncates mid-JSON and the whole review is lost."
   advisor_max_tokens:
     type: int
     default: 0

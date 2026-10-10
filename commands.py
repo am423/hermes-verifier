@@ -17,6 +17,7 @@ import json
 import re
 from typing import Any, Callable, Dict, List, Optional
 
+from . import gate as gate_mod
 from . import runtime
 
 _HELP = """\
@@ -54,11 +55,12 @@ def _status_lines() -> List[str]:
     budget_cap = int(runtime._config(cfg, "max_reviews_per_session", 0) or 0)
     tools_on = bool(runtime._config(cfg, "advisor_tools", False))
     nudge_turns = int(runtime._config(cfg, "nudge_first_turns", 0) or 0)
+    gate_on = bool(runtime._config(cfg, "gate_enabled", False))
     cap_label = str(budget_cap) if budget_cap else "unlimited"
     nudge_label = f"first {nudge_turns}" if nudge_turns else "off"
     lines.append(
         f"  advisor tools: {'on' if tools_on else 'off'} | nudge: {nudge_label}"
-        f" | review budget: {cap_label}"
+        f" | review budget: {cap_label} | gate: {'on' if gate_on else 'off'}"
     )
     # Engagement counters: a non-zero review count proves the advisor is
     # actually running; a rising empty count means it is not answering.
@@ -82,6 +84,26 @@ def _status_lines() -> List[str]:
             f"  engagement: {total_reviews} review(s), {total_empty} empty response(s)"
             f"{tok_seg}"
         )
+        # The gate's own line: how often it was consulted, how often it saved a
+        # review, and what it decided last. A gate that never skips anything is
+        # pure overhead, and this is where that shows.
+        checked = sum(int(s.get("gate_checked", 0) or 0)
+                      for s in snap["sessions"].values())
+        skipped = sum(int(s.get("gate_skipped", 0) or 0)
+                      for s in snap["sessions"].values())
+        if checked:
+            last = next((s.get("last_gate") for s in reversed(
+                list(snap["sessions"].values())) if s.get("last_gate")), None)
+            pct = f"{100 * skipped / checked:.0f}%"
+            verdict = ""
+            if last:
+                decision = gate_mod.GateDecision(
+                    bool(last.get("engage")), str(last.get("effort") or "deep"),
+                    str(last.get("source") or "model"))
+                verdict = " | " + gate_mod.describe(decision)
+            lines.append(
+                f"  gate: consulted {checked}x, skipped {skipped} ({pct}){verdict}"
+            )
 
     sessions = snap["sessions"]
     if not sessions:
