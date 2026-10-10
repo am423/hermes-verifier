@@ -454,3 +454,63 @@ def test_event_log(ctx, monkeypatch):
     assert seq == len(runtime.EVENT_LOG)
     assert runtime.events_after(0) == runtime.EVENT_LOG
     assert runtime.events_after(seq) == []
+
+
+# ── sync_backlog normalization + catch-up window ─────────────────────────────
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("off", 0), ("1", 1), ("3", 3), ("5", 5),
+    (1, 1), (3, 3),          # unquoted YAML int — the regression
+    (0, 0), ("0", 0), ("none", 0), ("", 0), (None, 0),
+    ("bogus", 0), (7, 0),    # out of OMP's enum range
+])
+def test_parse_sync_backlog(raw, expected):
+    assert runtime._parse_sync_backlog(raw) == expected
+
+
+def test_sync_backlog_int_setting_does_not_drop_finding(ctx, monkeypatch):
+    """Regression: an int setting crashed .isdigit() and the finding was lost."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["sync_backlog"] = 1          # what YAML actually gives us
+    ctx.llm.next = FakeResult({"severity": "caution",
+                               "finding": "Bypasses the durable queue in src/jobs",
+                               "reasoning": "skips the queue"})
+
+    _turn(ctx)
+
+    state = runtime._get_state("s1", create=False)
+    assert state.last_error == "", "handler swallowed an exception"
+    assert _default(state).pending is not None, "finding was dropped"
+
+
+def test_backlog_wait_waits_then_releases(monkeypatch):
+    """Waits while backlog >= threshold; releases on a failure streak."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(runtime.time, "sleep",
+                        lambda s: (clock.__setitem__("t", clock["t"] + s)))
+
+    state = runtime.SessionVerifier(session_id="s")
+    state.backlog = 2
+    runtime._backlog_wait(state, 1)
+    assert clock["t"] > 0, "should have waited while backlog was above threshold"
+
+    # Failure streak releases immediately even when still behind.
+    clock["t"] = 0.0
+    state.consecutive_failures = 3
+    runtime._backlog_wait(state, 1)
+    assert clock["t"] == 0, "a failing verifier must never stall the session"
+
+
+def test_backlog_wait_is_capped(monkeypatch):
+    clock = {"t": 0.0}
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(runtime.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + s))
+    state = runtime.SessionVerifier(session_id="s")
+    state.backlog = 99                       # never clears
+    runtime._backlog_wait(state, 1)
+    # Bounded by the cap plus at most one poll interval of overshoot.
+    assert clock["t"] <= runtime._BACKLOG_WAIT_CAP + runtime._BACKLOG_POLL
+    assert clock["t"] >= runtime._BACKLOG_WAIT_CAP, "should have waited the full cap"

@@ -489,6 +489,22 @@ def _schedule_review(state: SessionVerifier, delta_text: str) -> None:
 # Catch-up window (sync_backlog)
 # ---------------------------------------------------------------------------
 
+def _parse_sync_backlog(raw: Any) -> int:
+    """Normalize the sync_backlog setting to a turn threshold (0 = off).
+
+    OMP's advisor.syncBacklog takes the enum strings "1" | "3" | "5" or off.
+    Unquoted YAML gives us an int for ``sync_backlog: 1``, so accept both
+    shapes and treat anything unrecognised as off rather than raising — the
+    caller runs inside a broad except that would silently drop the finding.
+    """
+    if raw is None:
+        return 0
+    text = str(raw).strip().lower()
+    if text in {"off", "none", "", "0"}:
+        return 0
+    return int(text) if text.isdigit() and 1 <= int(text) <= 5 else 0
+
+
 def _backlog_wait(state: SessionVerifier, threshold: Optional[int]) -> None:
     """Optionally pace the primary turn while the verifier catches up.
 
@@ -593,9 +609,9 @@ def handle_post_llm_call(
         if not delta_text:
             return
         _schedule_review(state, delta_text)
-        sync = str(_config(_CTX, "sync_backlog", "off") or "off").strip()
-        if sync.isdigit():
-            _backlog_wait(state, int(sync))
+        backlog_threshold = _parse_sync_backlog(_config(_CTX, "sync_backlog", "off"))
+        if backlog_threshold:
+            _backlog_wait(state, backlog_threshold)
     except Exception as exc:  # pragma: no cover - defense in depth
         logger.warning("post_llm_call handler failed: %s", exc)
 
