@@ -87,8 +87,8 @@ def ctx(tmp_path):
     runtime._ROSTER_OVERRIDE = None
 
 
-def _review_sync(state, delta_text):
-    runtime._run_review(state, delta_text)
+def _review_sync(state, delta_text, origin_turn=0):
+    runtime._run_review(state, delta_text, origin_turn)
 
 
 def _turn(ctx, session="s1", history=None, response="final answer"):

@@ -348,8 +348,14 @@ def _render_finding(slug: str, finding: Dict[str, Any]) -> str:
     severity = finding.get("severity", "note")
     text = str(finding.get("finding", "")).strip()
     attrs = [f'verifier="{slug}"', f'severity="{severity}"']
+    # Name the turn this finding reviewed whenever it is not the turn now
+    # running. Without it the finding reads as a judgement on the CURRENT turn's
+    # work, which is how a review of turn 4 gets answered by turn 5.
+    origin = int(finding.get("origin_turn") or 0)
+    if origin:
+        attrs.append(f'reviewed_turn="{origin}"')
     if slug == DEFAULT_VERIFIER:
-        attrs = [f'severity="{severity}"']
+        attrs = [a for a in attrs if not a.startswith("verifier=")]
     return (
         f"<finding {' '.join(attrs)} guidance=\"weigh, don't blindly obey\">\n"
         f"{text}\n</finding>"
@@ -405,7 +411,8 @@ def _call_structured(ctx: Any, *, system_prompt: str, instructions: str,
 def _record_and_deliver(state: SessionVerifier, verifier: Verifier,
                         parsed: Dict[str, Any], accepted: bool,
                         usage: Any, delta_excerpt: str = "",
-                        prompt_parts: Optional[Dict[str, Any]] = None) -> None:
+                        prompt_parts: Optional[Dict[str, Any]] = None,
+                        origin_turn: int = 0) -> None:
     severity = str(parsed.get("severity") or "none").strip().lower()
     finding_text = str(parsed.get("finding") or "").strip()
     reasoning = str(parsed.get("reasoning") or "").strip()
@@ -417,6 +424,9 @@ def _record_and_deliver(state: SessionVerifier, verifier: Verifier,
         "finding": finding_text,
         "reasoning": reasoning,
         "accepted": accepted,
+        # The primary turn whose delta was reviewed. A finding is accounted to
+        # this turn, never to the turn that later delivers it.
+        "origin_turn": origin_turn,
         "model": verifier.stats["model"],
         "delta_excerpt": delta_excerpt[:2000],
         "prompt_parts": prompt_parts or {},
@@ -429,7 +439,8 @@ def _record_and_deliver(state: SessionVerifier, verifier: Verifier,
     _append_jsonl(_log_path(state.session_id, verifier.slug), record)
     publish_event("review", {"session_id": state.session_id,
                              "verifier": verifier.slug, "severity": severity,
-                             "finding": finding_text[:240], "accepted": accepted})
+                             "finding": finding_text[:240], "accepted": accepted,
+                             "origin_turn": origin_turn})
     if not accepted:
         return
     verifier.stats["findings"] += 1
@@ -438,10 +449,12 @@ def _record_and_deliver(state: SessionVerifier, verifier: Verifier,
         "severity": severity,
         "finding": finding_text,
         "reasoning": reasoning,
+        "origin_turn": origin_turn,
     }
     publish_event("finding", {"session_id": state.session_id,
                               "verifier": verifier.slug, "severity": severity,
-                              "finding": finding_text[:240]})
+                              "finding": finding_text[:240],
+                              "origin_turn": origin_turn})
     logger.info(
         "verifier %s raised %s finding for %s: %s",
         verifier.slug, severity, state.session_id, finding_text[:120],
@@ -458,7 +471,7 @@ def _plugin_llm_trust_error_type() -> Any:
 
 
 def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
-                effort: str = "deep") -> None:
+                effort: str = "deep", origin_turn: int = 0) -> None:
     ctx = _CTX
     if ctx is None:
         return
@@ -600,7 +613,8 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
         # Still record: cost must be measurable for reviews that find nothing,
         # otherwise the majority of spend is invisible.
         _record_and_deliver(state, verifier, parsed, False, usage,
-                            delta_excerpt=delta_text, prompt_parts=parts)
+                            delta_excerpt=delta_text, prompt_parts=parts,
+                            origin_turn=origin_turn)
         return
     # Restatement suppression lives in guard.py as exact-text dedupe. A
     # semantic pass was built here and removed: measured against realistic
@@ -609,11 +623,18 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
     # genuine findings. See sidecar/NEGATIVE-RESULTS.md.
     accepted = verifier.guard.accept(severity, finding_text)
     _record_and_deliver(state, verifier, parsed, accepted, usage,
-                        delta_excerpt=delta_text, prompt_parts=parts)
+                        delta_excerpt=delta_text, prompt_parts=parts,
+                        origin_turn=origin_turn)
 
 
-def _run_review(state: SessionVerifier, delta_text: str) -> None:
-    """One review cycle for every enabled verifier. Background thread."""
+def _run_review(state: SessionVerifier, delta_text: str,
+                origin_turn: int = 0) -> None:
+    """One review cycle for every enabled verifier. Background thread.
+
+    ``origin_turn`` is the primary turn that produced ``delta_text``. It is
+    carried through to the finding so the review is accounted to the turn that
+    produced it, not the turn that receives it.
+    """
     if _CTX is None:
         return
     if not _INFLIGHT.acquire(blocking=False):
@@ -643,7 +664,8 @@ def _run_review(state: SessionVerifier, delta_text: str) -> None:
                 logger.debug("gate skipped %s (%s)", state.session_id, decision.source)
                 return
             for verifier in state.enabled_verifiers():
-                _review_one(state, verifier, delta_text, effort=decision.tier)
+                _review_one(state, verifier, delta_text,
+                           effort=decision.tier, origin_turn=origin_turn)
         finally:
             with _LOCK:
                 state.reviewing = False
@@ -680,7 +702,8 @@ def _gate_decision(state: SessionVerifier, delta_text: str) -> "gate_mod.GateDec
         return gate_mod.FAIL_SAFE
 
 
-def _schedule_review(state: SessionVerifier, delta_text: str) -> None:
+def _schedule_review(state: SessionVerifier, delta_text: str,
+                     origin_turn: int = 0) -> None:
     # Claude Code caps advisor calls per request (max_uses); OMP has no cap at
     # all, so a noisy roster silently runs up bill. This is the session-scoped
     # version. The counter increments before dispatch, so a review that fails
@@ -692,12 +715,12 @@ def _schedule_review(state: SessionVerifier, delta_text: str) -> None:
             return
         state.reviews_used += 1
     if _REVIEW_FN_OVERRIDE is not None:
-        _REVIEW_FN_OVERRIDE(state, delta_text)
+        _REVIEW_FN_OVERRIDE(state, delta_text, origin_turn)
         return
     with _LOCK:
         state.backlog += 1
     thread = threading.Thread(
-        target=_run_review, args=(state, delta_text),
+        target=_run_review, args=(state, delta_text, origin_turn),
         name=f"hermes-verifier:{state.session_id[:24]}", daemon=True,
     )
     with _THREADS_LOCK:
@@ -850,7 +873,14 @@ def handle_post_llm_call(
         state.cursor_len = new_cursor
         if not delta_text:
             return
-        _schedule_review(state, delta_text)
+        # The turn that PRODUCED this delta. pre_llm_call already incremented
+        # turns_seen for the turn that is now ending, so this is that turn's
+        # number. A finding from this delta belongs to this turn even though the
+        # review finishes after it, and it must never be accounted to the turn
+        # that happens to deliver it.
+        with _LOCK:
+            origin_turn = state.turns_seen
+        _schedule_review(state, delta_text, origin_turn)
         backlog_threshold = _parse_sync_backlog(_config(_CTX, "sync_backlog", "off"))
         if backlog_threshold:
             _backlog_wait(state, backlog_threshold)
@@ -886,6 +916,18 @@ def handle_pre_llm_call(session_id: Any = "", **kwargs: Any) -> Optional[Dict[st
                    if v.pending is not None}
         for verifier in state.verifiers.values():
             verifier.pending = None
+        # The turn now starting. A finding is accounted to its origin_turn, so
+        # this is recorded only to make the gap visible -- a finding that lands
+        # many turns late is a pacing symptom, not a finding about this turn.
+        delivered_turn = state.turns_seen
+    for slug, finding in pending.items():
+        publish_event("finding_delivered", {
+            "session_id": state.session_id,
+            "verifier": slug,
+            "severity": finding.get("severity", "note"),
+            "origin_turn": int(finding.get("origin_turn") or 0),
+            "delivered_turn": delivered_turn,
+        })
     if not pending and not nudge:
         # A quiet turn still ticks the immunity clock down. Without this the
         # cooldown could never drain, so one early blocker would mute the
