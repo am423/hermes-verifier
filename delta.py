@@ -168,7 +168,18 @@ def extract_delta(
     if not tail:
         return new_cursor, None
     if len(tail) > max_chars:
-        tail = tail[:max_chars] + "\n… [delta truncated]"
+        # Keep BOTH ends. The tail is built oldest->newest and "[assistant final]"
+        # is appended last, so a plain head slice silently deletes the agent's
+        # final answer -- the one thing a reviewer most needs, since it is what
+        # the agent is actually claiming. The head keeps the request in view.
+        # Mirrors gate.build_digest, which made the same choice for the same
+        # reason; a reviewer given only the start of a turn reviews blind.
+        marker = "\n… [delta truncated] …\n"
+        room = max(0, max_chars - len(marker))
+        head = room // 3
+        tail_len = room - head
+        tail = (f"{tail[:head]}{marker}{tail[-tail_len:]}"
+                if tail_len > 0 else f"{tail[:head]}{marker}")
     return new_cursor, tail
 
 

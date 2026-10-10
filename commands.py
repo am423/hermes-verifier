@@ -52,9 +52,9 @@ def _status_lines() -> List[str]:
     default_enabled = bool(runtime._config(cfg, "enabled", False))
     model_cfg = str(runtime._config(cfg, "verifier_model", "") or "").strip() or "(primary model)"
     lines.append(f"[hermes-verifier] config default: {'on' if default_enabled else 'off'} | model: {model_cfg}")
-    budget_cap = int(runtime._config(cfg, "max_reviews_per_session", 0) or 0)
+    budget_cap = runtime.safe_int(runtime._config(cfg, "max_reviews_per_session", 0))
     tools_on = bool(runtime._config(cfg, "advisor_tools", False))
-    nudge_turns = int(runtime._config(cfg, "nudge_first_turns", 0) or 0)
+    nudge_turns = runtime.safe_int(runtime._config(cfg, "nudge_first_turns", 0))
     gate_on = bool(runtime._config(cfg, "gate_enabled", False))
     cap_label = str(budget_cap) if budget_cap else "unlimited"
     nudge_label = f"first {nudge_turns}" if nudge_turns else "off"
@@ -77,8 +77,8 @@ def _status_lines() -> List[str]:
         for s in snap["sessions"].values():
             for v in (s.get("verifiers") or {}).values():
                 st = v.get("stats") or {}
-                est = max(est, int(st.get("est_tokens", 0) or 0))
-                actual = max(actual, int(st.get("last_input_tokens", 0) or 0))
+                est = max(est, runtime.safe_int(st.get("est_tokens", 0)))
+                actual = max(actual, runtime.safe_int(st.get("last_input_tokens", 0)))
         tok_seg = f" | last review: ~{est} est / {actual} actual tokens" if actual else ""
         lines.append(
             f"  engagement: {total_reviews} review(s), {total_empty} empty response(s)"
@@ -87,9 +87,9 @@ def _status_lines() -> List[str]:
         # The gate's own line: how often it was consulted, how often it saved a
         # review, and what it decided last. A gate that never skips anything is
         # pure overhead, and this is where that shows.
-        checked = sum(int(s.get("gate_checked", 0) or 0)
+        checked = sum(runtime.safe_int(s.get("gate_checked", 0))
                       for s in snap["sessions"].values())
-        skipped = sum(int(s.get("gate_skipped", 0) or 0)
+        skipped = sum(runtime.safe_int(s.get("gate_skipped", 0))
                       for s in snap["sessions"].values())
         if checked:
             last = next((s.get("last_gate") for s in reversed(

@@ -289,6 +289,21 @@ def subsystem_enabled(session_id: Any) -> bool:
         return False
 
 
+def safe_int(value: Any, default: int = 0) -> int:
+    """Coerce a config or telemetry value to int without ever raising.
+
+    Settings are hand-edited YAML. ``nudge_first_turns: abc`` used to raise
+    ValueError straight out of ``/verify status`` and 500 the dashboard
+    ``/state`` endpoint -- i.e. a bad setting crashed the very surface that
+    would have shown the operator what was wrong. Degrade to the default
+    instead.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _config(ctx: Any, key: str, default: Any) -> Any:
     try:
         return ctx.get_config(key, default)
@@ -1123,6 +1138,13 @@ def snapshot() -> Dict[str, Any]:
                 "reviewing": st.reviewing,
                 "backlog": st.backlog,
                 "reviews_used": st.reviews_used,
+                # Counted in _review_one but previously never exposed, so both
+                # consumers (commands._status_lines, plugin_api state) read it
+                # via .get(..., 0) and reported 0 forever. That silently disabled
+                # the one documented signal that the reviewer is DEAD rather
+                # than finding nothing: "a rising empty count with a flat review
+                # count means the advisor model is not answering".
+                "empty_responses": st.empty_responses,
                 "gate_checked": st.gate_checked,
                 "gate_skipped": st.gate_skipped,
                 "last_gate": ({"engage": st.last_gate.engage,

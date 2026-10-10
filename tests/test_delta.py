@@ -157,12 +157,89 @@ def test_tool_result_rows_are_capped_in_the_delta():
 
 
 def test_delta_truncation_marks_and_bounds():
-    """The cap must bound output and say so, so a cut review is visible."""
+    """The cap must bound output and say so, so a cut review is visible.
+
+    The marker sits MID-text on purpose: the newest content (including the
+    agent's final answer) is retained, so a cut delta ends in real content.
+    This assertion previously required the marker at the very end, which only
+    held because the old truncation discarded the tail outright.
+    """
     hist = [{"role": "tool", "tool_call_id": "c1",
              "content": "\n".join(f"line {i}" for i in range(3000))} for _ in range(12)]
     _cursor, rendered = delta.extract_delta(
         cursor_len=None, conversation_history=hist,
         assistant_response="done", max_chars=2000,
     )
-    assert len(rendered) <= 2000 + len("\n… [delta truncated]") + 1
-    assert rendered.endswith("[delta truncated]"), "a cut delta must be marked"
+    assert len(rendered) <= 2000, "the cap must bound the rendered delta"
+    assert "[delta truncated]" in rendered, "a cut delta must be marked"
+    assert not rendered.endswith("[delta truncated]"), (
+        "the newest content must survive, so the marker cannot be the last thing"
+    )
+
+
+# ── Truncation must not delete the newest content ────────────────────────────
+
+# NOTE: use realistic multi-line text, never a single long repeated token.
+# redact() collapses a long token to "[long-token]", which silently shrinks the
+# content below the cap and means the truncation under test never runs.
+
+
+def _realistic_body(lines: int = 80) -> str:
+    return "\n".join(
+        f"2026-10-10 14:00:{i % 60:02d} INFO worker completed task {i}"
+        for i in range(lines)
+    )
+
+
+def test_truncation_keeps_the_final_answer():
+    """The delta is built oldest->newest with [assistant final] appended LAST.
+
+    Cutting from the end therefore removes the primary agent's final answer --
+    the single most important thing a reviewer needs, because it is what the
+    agent is actually claiming. The reviewer would otherwise judge the start of
+    a turn whose conclusion it cannot see.
+    """
+    from verifier_pkg import delta
+
+    history = [{"role": "user", "content": "do the thing"},
+               {"role": "assistant", "content": _realistic_body()}]
+    _, text = delta.extract_delta(cursor_len=None, conversation_history=history,
+                                  assistant_response="FINAL ANSWER MARKER",
+                                  max_chars=2000)
+    assert text is not None
+    assert "truncated" in text, "precondition: this case must actually truncate"
+    assert "FINAL ANSWER MARKER" in text, (
+        "truncation dropped the final answer; the reviewer cannot review what "
+        "the agent actually concluded"
+    )
+
+
+def test_truncation_keeps_both_ends():
+    """Head carries the request, tail carries the outcome. Drop the middle."""
+    from verifier_pkg import delta
+
+    history = [{"role": "user", "content": "HEAD MARKER"},
+               {"role": "assistant", "content": _realistic_body(120)}]
+    _, text = delta.extract_delta(cursor_len=None, conversation_history=history,
+                                  assistant_response="TAIL MARKER", max_chars=1500)
+    assert "truncated" in text, "precondition: this case must actually truncate"
+    assert "HEAD MARKER" in text
+    assert "TAIL MARKER" in text
+
+
+def test_truncation_respects_the_cap():
+    from verifier_pkg import delta
+
+    history = [{"role": "assistant", "content": _realistic_body(200)}]
+    _, text = delta.extract_delta(cursor_len=None, conversation_history=history,
+                                  assistant_response="done", max_chars=2000)
+    assert len(text) <= 2000 + 40
+
+
+def test_a_short_delta_is_untouched():
+    from verifier_pkg import delta
+
+    history = [{"role": "user", "content": "hi"}]
+    _, text = delta.extract_delta(cursor_len=None, conversation_history=history,
+                                  assistant_response="done", max_chars=20000)
+    assert "truncated" not in text

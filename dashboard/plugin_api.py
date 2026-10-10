@@ -55,6 +55,17 @@ _MODULE_CANDIDATES = (
 )
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Delegate to the live runtime's helper so the two surfaces cannot drift."""
+    runtime = _runtime()
+    if runtime is not None and hasattr(runtime, "safe_int"):
+        return runtime.safe_int(value, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _runtime() -> Any:
     """Return the live runtime module, or None when it is not loaded."""
     for name in _MODULE_CANDIDATES:
@@ -155,15 +166,15 @@ def _state_payload() -> Dict[str, Any]:
         "enabled": bool(settings.get("enabled", False)),
         "model": str(settings.get("verifier_model") or ""),
         "sync_backlog": str(settings.get("sync_backlog") or "off"),
-        "immunity_turns": int(settings.get("immunity_turns", 3)),
-        "max_delta_chars": int(settings.get("max_delta_chars", 20000)),
+        "immunity_turns": _safe_int(settings.get("immunity_turns", 3), 3),
+        "max_delta_chars": _safe_int(settings.get("max_delta_chars", 20000), 20000),
         "blocker_steer": bool(settings.get("blocker_steer", True)),
         # Advisor-mode controls (must mirror /verify status and plugin.yaml).
         "advisor_tools": bool(settings.get("advisor_tools", False)),
         "default_tools": list(settings.get("default_tools") or []),
-        "max_reviews_per_session": int(settings.get("max_reviews_per_session", 0) or 0),
-        "advisor_max_tokens": int(settings.get("advisor_max_tokens", 0) or 0),
-        "nudge_first_turns": int(settings.get("nudge_first_turns", 0) or 0),
+        "max_reviews_per_session": _safe_int(settings.get("max_reviews_per_session", 0)),
+        "advisor_max_tokens": _safe_int(settings.get("advisor_max_tokens", 0)),
+        "nudge_first_turns": _safe_int(settings.get("nudge_first_turns", 0)),
     }
     payload["primary"] = _primary_model()
     payload["transcript"] = _transcript_from_disk(None, 60)
