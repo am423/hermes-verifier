@@ -40,6 +40,8 @@ class FakeLlm:
         self.next: Any = None
         self.queue: list = []
         self.raise_error: Exception | None = None
+        # Overridden per-test when a test asserts on tool dispatch.
+        self.dispatch_tool = lambda name, args: "[fake tool result]"
 
     def complete_structured(self, **kwargs) -> FakeResult:
         self.calls.append(kwargs)
@@ -514,3 +516,89 @@ def test_backlog_wait_is_capped(monkeypatch):
     # Bounded by the cap plus at most one poll interval of overshoot.
     assert clock["t"] <= runtime._BACKLOG_WAIT_CAP + runtime._BACKLOG_POLL
     assert clock["t"] >= runtime._BACKLOG_WAIT_CAP, "should have waited the full cap"
+
+
+# ── Advisor tool verification ────────────────────────────────────────────────
+
+
+def test_advisor_tools_verify_a_claim(ctx, monkeypatch):
+    """With the grant on, the advisor's tool result reaches the review prompt.
+
+    Tools are per-verifier: a roster entry (or default_tools) must request them
+    AND advisor_tools must be on. Only the 'claims' verifier has a grant, so
+    only it may make tool calls — the default verifier reviews prose alone.
+    """
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["advisor_tools"] = True
+    runtime._ROSTER_OVERRIDE = [{
+        "name": "Claims", "slug": "claims", "enabled": True,
+        "model": "", "tools": ["read_file"], "instructions": "",
+    }]
+    # The default verifier runs first and has no grant: it must not consume the
+    # tool call. Route responses per verifier so each sees its own script.
+    responses = {
+        "claims": [
+            FakeResult({"severity": "none", "finding": "", "reasoning": ""},
+                       text='TOOL_CALL: read_file {"path": "src/jobs/queue.py"}'),
+            FakeResult({"severity": "caution",
+                        "finding": "Confirmed: src/jobs/write.py bypasses the durable queue",
+                        "reasoning": "read both files"}),
+        ],
+    }
+
+    def _fake_complete(**kwargs):
+        ctx.llm.calls.append(kwargs)
+        has_tools = "TOOL_CALL" in kwargs["system_prompt"]
+        if not has_tools:
+            # Default verifier: no grant, prose review only.
+            return FakeResult({"severity": "none", "finding": "", "reasoning": ""})
+        return responses["claims"].pop(0)
+
+    ctx.llm.complete_structured = _fake_complete
+    dispatched = []
+    ctx.dispatch_tool = lambda name, args: dispatched.append(name) or "def enqueue(job): ..."
+
+    _turn(ctx)
+
+    calls = ctx.llm.calls
+    assert len(calls) >= 2, "advisor should have made a verification call"
+    # The tool result must appear in the review that follows the tool call.
+    verifying = [c for c in calls if "def enqueue" in c["input"][0]["text"]]
+    assert verifying, "tool output must feed the review"
+    assert dispatched == ["read_file"]
+    state = runtime._get_state("s1", create=False)
+    assert state.verifiers["claims"].pending is not None
+    assert state.verifiers["claims"].pending["severity"] == "caution"
+
+
+def test_default_tools_grant_applies_without_a_roster(ctx, monkeypatch):
+    """default_tools grants the default verifier tools when advisor_tools is on."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["advisor_tools"] = True
+    ctx.config["default_tools"] = ["read_file", "terminal"]   # terminal must be refused
+    ctx.llm.queue = [
+        FakeResult({"severity": "none", "finding": "", "reasoning": ""},
+                   text='TOOL_CALL: read_file {"path": "a.py"}'),
+        FakeResult({"severity": "note", "finding": "verified", "reasoning": ""}),
+    ]
+    dispatched = []
+    ctx.dispatch_tool = lambda name, args: dispatched.append(name) or "contents"
+
+    _turn(ctx)
+
+    assert dispatched == ["read_file"], "only the allowlisted tool may run"
+    assert _default(runtime._get_state("s1", create=False)).pending is not None
+
+
+def test_advisor_tools_off_by_default(ctx, monkeypatch):
+    """Zero-config behavior is unchanged: one call, no tool dispatch."""
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.llm.next = FakeResult({"severity": "note", "finding": "nit: rename x", "reasoning": ""})
+    dispatched = []
+    ctx.dispatch_tool = lambda name, args: dispatched.append(n) or "should not happen"
+
+    _turn(ctx)
+
+    assert len(ctx.llm.calls) == 1
+    assert dispatched == []
+    assert "TOOL_CALL" not in ctx.llm.calls[0]["system_prompt"]

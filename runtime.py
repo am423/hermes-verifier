@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from . import advisor_tools as tools_mod
 from . import brief, delta as delta_mod, guard as guard_mod
 
 logger = logging.getLogger("hermes-verifier")
@@ -112,6 +113,7 @@ class Verifier:
     name: str
     model: str = ""          # "provider/model" override; "" = inherit default
     tools: List[str] = field(default_factory=list)
+    tool_grant: List[str] = field(default_factory=list)
     instructions: str = ""
     shared_instructions: str = ""
     guard: guard_mod.EmissionGuard = field(default_factory=guard_mod.EmissionGuard)
@@ -153,6 +155,9 @@ class SessionVerifier:
             self.verifiers[DEFAULT_VERIFIER] = Verifier(
                 slug=DEFAULT_VERIFIER, name="Default",
             )
+        # The default verifier takes its grant from the default_tools setting.
+        default_grant = _config(_CTX, "default_tools", []) or []
+        self.verifiers[DEFAULT_VERIFIER].tool_grant = tools_mod.resolve_grant(default_grant)
         for entry in roster:
             slug = str(entry.get("slug") or entry.get("name"))
             if not entry.get("enabled", True):
@@ -167,6 +172,7 @@ class SessionVerifier:
             verifier.tools = list(entry.get("tools") or [])
             verifier.instructions = str(entry.get("instructions") or "")
             verifier.shared_instructions = str(entry.get("shared_instructions") or "")
+            verifier.tool_grant = tools_mod.resolve_grant(verifier.tools)
 
     def enabled_verifiers(self) -> List[Verifier]:
         return [v for v in self.verifiers.values()]
@@ -317,7 +323,8 @@ def _resolve_model_for(ctx: Any, verifier: Verifier) -> tuple:
 
 def _call_structured(ctx: Any, *, system_prompt: str, instructions: str,
                      input_text: str, provider: Optional[str],
-                     model: Optional[str]) -> Any:
+                     model: Optional[str],
+                     max_tokens: Optional[int] = None) -> Any:
     from agent.plugin_llm import PluginLlmTrustError  # noqa: F401
 
     kwargs: Dict[str, Any] = dict(
@@ -330,6 +337,8 @@ def _call_structured(ctx: Any, *, system_prompt: str, instructions: str,
         purpose="hermes-verifier review",
         timeout=120.0,
     )
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
     if provider:
         kwargs["provider"] = provider
     if model:
@@ -401,10 +410,34 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
         system_prompt = brief.build_system_prompt(
             extra_instructions=verifier.shared_instructions + "\n\n" + verifier.instructions
         )
-        result = _call_structured(
-            ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
-            input_text=delta_text, provider=provider, model=model,
-        )
+        # Tools only engage when the operator opts in AND the roster granted some.
+        grant = verifier.tool_grant if _config(ctx, "advisor_tools", False) else []
+        if grant:
+            block = tools_mod.render_available(grant)
+            if block:
+                system_prompt = f"{system_prompt}\n\n{block}"
+        cap = int(_config(ctx, "advisor_max_tokens", 0) or 0)
+        cap_kwargs = {"max_tokens": cap} if cap >= 1024 else {}
+        transcript = delta_text
+        result = None
+        # Bounded: the advisor may verify a claim, then must produce its envelope.
+        # A verifier with no grant is never told about tools, so it makes exactly
+        # one call — parse_tool_call would refuse anyway, but skipping the loop
+        # keeps its transcript and prompt byte-identical to the pre-tools build.
+        attempts = tools_mod.MAX_TOOL_CALLS + 1 if grant else 1
+        for _attempt in range(attempts):
+            result = _call_structured(
+                ctx, system_prompt=system_prompt, instructions=brief.REVIEW_TASK,
+                input_text=transcript, provider=provider, model=model, **cap_kwargs,
+            )
+            call = tools_mod.parse_tool_call(getattr(result, "text", "") or "", grant)
+            if call is None:
+                break
+            output = tools_mod.dispatch(ctx, call)
+            transcript = (
+                f"{delta_text}\n\n---\nTool result from {call['tool']}:\n{output}\n"
+                "Now give your final review envelope (severity/finding/reasoning)."
+            )
     except Exception as exc:
         cls = type(exc).__name__
         if trust_error_type is not None and isinstance(exc, trust_error_type):

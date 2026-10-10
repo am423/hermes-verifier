@@ -50,6 +50,10 @@ config_schema:
     type: bool
     default: false
     description: "Let advisors verify claims with read-only tools (read_file, search_files) instead of reviewing prose alone. Off by default; a roster entry may enable it per advisor."
+  default_tools:
+    type: list
+    default: []
+    description: "Read-only tools granted to the DEFAULT verifier when advisor_tools is on. Only read_file and search_files are permitted; anything else is refused."
   max_reviews_per_session:
     type: int
     default: 0
