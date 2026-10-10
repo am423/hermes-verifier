@@ -603,11 +603,18 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str) -> 
     if accepted:
         thr = float(_config(_CTX, "semantic_dedupe_threshold", 0.0) or 0.0)
         if thr > 0 and verifier.recent_findings:
-            prob = dedupe_mod.ask(verifier.recent_findings[-1], finding_text)
-            if dedupe_mod.should_suppress(prob, threshold=thr):
-                logger.info("semantic dedupe suppressed a restatement for %s (p=%.3f)",
-                            state.session_id, prob)
-                accepted = False
+            # Compare against every retained finding, newest first, stopping at
+            # the first confident match. Comparing only the newest would let a
+            # paraphrase of an earlier finding through, making the retained
+            # window pointless; the early exit keeps the usual cost at one call.
+            for prior in reversed(verifier.recent_findings):
+                prob = dedupe_mod.ask(prior, finding_text)
+                if dedupe_mod.should_suppress(prob, threshold=thr):
+                    logger.info(
+                        "semantic dedupe suppressed a restatement for %s (p=%.3f)",
+                        state.session_id, prob)
+                    accepted = False
+                    break
     _record_and_deliver(state, verifier, parsed, accepted, usage,
                         delta_excerpt=delta_text, prompt_parts=parts)
     if accepted:

@@ -21,7 +21,7 @@ or deserves attention. Every earlier failure came from asking it to judge.
 `criteria` matters enormously for the factual case: separation rises from
 **+0.429** (no criteria) to **+0.841** (with criteria).
 
-## Application 1 — semantic dedupe (RECOMMENDED)
+## Application 1 — semantic dedupe (SHIPPED, off by default)
 
 **The problem it solves.** `guard.py` dedupes on normalised *exact text*. A
 finding restated in different words re-surfaces and nags the user, which the
@@ -43,27 +43,42 @@ p=0.025  diff  "command injection" / "docstring missing a period"
 p=0.119  diff  "token truncation" / "variable name 'x' unclear"
 p=0.002  diff  "hardcoded credentials" / "isort import order"
 p=0.034  diff  "retry loop untested" / "log message typo"
-
-paraphrases mean 0.454 | distinct mean 0.053 | separation +0.400 | pairwise 76%
-
-threshold sweep:  thr=0.5   suppress 2/10  wrongly-suppressed 0  SAFE
-                  thr=0.8   suppress 2/10  wrongly-suppressed 0  SAFE
-                  thr=0.9   suppress 2/10  wrongly-suppressed 0  SAFE
-                  thr=0.95  suppress 2/10  wrongly-suppressed 0  SAFE
 ```
 
-**This is the decisive contrast with the gate.** The gate was UNSAFE at every
-threshold; dedupe is SAFE at every threshold. The failure modes are not
-symmetrical:
+### The honest scorecard: high precision, LOW RECALL
 
+| metric | value |
+| --- | --- |
+| **recall — paraphrases caught (p >= 0.5)** | **2 / 5 = 40%** |
+| precision — wrongly suppressed distinct pairs | **0 / 5** |
+| separation | +0.400 |
+| pairwise accuracy | 76% |
+| suppressed at threshold 0.5 / 0.8 / 0.9 / 0.95 | 2 / 2 / 2 / 2, all correct |
+
+**Both numbers matter together.** The safety claim ("0 wrongly suppressed at
+every threshold") is real, but it is only meaningful next to the recall: **this
+detects a minority of restatements, not all of them.** Three of five paraphrases
+scored 0.020, 0.049 and 0.230 — well below any usable threshold — so they will
+still re-surface exactly as they do today.
+
+So the value is: **a small reduction in repeat findings, at zero added risk.**
+Not a fix for duplicate nagging. The exact-text guard remains the primary
+mechanism; this only trims a fraction of the remainder.
+
+**Shipped default: `semantic_dedupe_threshold: 0.0` — the stage is OFF.** With it
+off, behaviour is byte-identical to before. The owner decides whether a ~40%
+catch rate on restatements is worth running the sidecar and enabling it.
+
+### Why acting on it is safe, when gating was not
+
+- a wrongly **suppressed** duplicate loses a *repeat* of a finding that already
+  fired — annoying, recoverable, self-correcting
 - a wrongly **skipped** review loses a finding that would otherwise have existed
   — an unobservable quality loss
-- a wrongly **suppressed** duplicate loses a *repeat* of a finding that already
-  fired — annoying, recoverable, and self-correcting
 
-It catches 2/5 paraphrases that exact-text dedupe misses and 0/5 distinct pairs
-by mistake. Modest gain, no new risk. Suppress only above a high threshold; below
-it, behave exactly as today.
+Only the second is irrecoverable, and the gate was unsafe at *every* threshold
+while this is safe at every threshold. But "safe" is not "effective": read both
+columns.
 
 ## Application 2 — secret/redaction check (promising, UNTESTED)
 
@@ -131,3 +146,83 @@ useful and safe. Effort tiering second. Gating: no.
 
 Then test the redaction check, which by the dividing line should be the next
 strongest fit.
+
+---
+
+## Can we train this model for better call gating?
+
+Short answer: **legally yes, practically yes with custom work, but it is the
+wrong first move.** Test a bigger off-the-shelf decision model before building a
+training pipeline.
+
+### What is permitted
+
+The blog states the models are *"Open-weight — Download, fine-tune, and deploy
+without restrictions."* So there is no licensing barrier.
+
+### What is NOT provided
+
+Liquid's official fine-tuning repo, **LEAP Finetune**, is scoped to *"Liquid
+Foundation Models (LFMs)"* — the generative family. Its examples train
+`LFM2-1.2B` with SFT/DPO/GRPO, and the blog draws the distinction explicitly:
+
+> "Unlike our generative Liquid Foundation Models (LFMs), our d1 decision models
+> don't produce tokens. Instead, they produce an answer in a single forward pass."
+
+A decision model ends in a **classification head over option logits**, not a
+token distribution. Token-level SFT/DPO/GRPO does not apply; training one means
+writing a cross-entropy objective over the option positions yourself. **There is
+no documented recipe or tooling for training decision models.**
+
+### The real bottleneck is labels, not compute
+
+A 587M model is cheap to fine-tune — a single consumer GPU, plausibly a Mac. The
+cost is the training set: hundreds to thousands of labelled
+`(delta_state, should_review)` pairs. Ten were hand-labelled for this
+investigation; a gate needs orders of magnitude more.
+
+**The label pipeline already exists in design, from the evaluation plan:**
+shadow sampling. A shadowed skip that later produces a caution or blocker is a
+*positive* label — a case the gate got wrong. That is exactly the data a gate
+needs, gathered automatically from real traffic. The decision journal records the
+input state and the confidence for every decision, so labelling is a join, not a
+chore.
+
+So the honest order of operations is:
+
+1. **Shadow sampling must run first**, or there are no labels at all. This is
+   also the only mechanism that reveals gate errors, since a wrongly skipped
+   review is otherwise invisible.
+2. Collect labels until the positive class is large enough to train on. At a 10%
+   shadow rate this is slow — many hundreds of sessions.
+3. Only then train.
+
+### The cheaper alternative that should be tried first
+
+**Test `d1-3B` zero-shot.** Liquid scores it **48.57** on their Decision Index
+against d1-omni-600M's **15.95** — three times the decision quality, and the docs
+label it *"Recommended"* versus *"Smallest"*. It is 3.1B parameters, runs on the
+same stack, and needs no labels, no training loop, and no eval harness.
+
+`sidecar/official_pattern.py` re-tests it in one command by changing `MODEL_ID`.
+If d1-3B gates acceptably, training is unnecessary; if it does not, that is
+strong evidence the task needs training rather than a bigger zero-shot model —
+and now with a baseline to beat.
+
+### Why this may not be worth doing at all
+
+**A locally trained checkpoint cannot ship in a catalog plugin.** This plugin is
+destined for the Hermes plugin catalog, installed at a pinned commit by users who
+have no model and no GPU. A custom decision head is a personal optimization, not
+a distributable feature — so its value accrues only to this machine.
+
+Weigh that against the alternative already shipped: semantic dedupe at ~40%
+recall and zero risk, and effort tiering, both of which work with the model as-is.
+
+### Recommendation
+
+1. Do not train yet.
+2. Re-run the harness against **d1-3B** (one-line change).
+3. Implement **shadow sampling** if a gate is still wanted after that — it is
+   required for labels *and* it is the only way to see gate errors.
+4. Train only with a real positive-class count and a d1-3B baseline to beat.

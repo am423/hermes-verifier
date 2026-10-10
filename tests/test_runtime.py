@@ -1342,3 +1342,35 @@ def test_semantic_dedupe_keeps_finding_when_unsure(ctx, monkeypatch):
 
     v = _default(runtime._get_state("s1", create=False))
     assert v.pending is not None, "an unsure dedupe must not drop findings"
+
+
+def test_semantic_dedupe_checks_ALL_recent_findings(ctx, monkeypatch):
+    """A paraphrase of the 2nd-most-recent finding must also be caught.
+
+    Keeping five findings but comparing only against [-1] means a restatement of
+    an earlier one slips through -- the retained window was doing nothing.
+    """
+    from verifier_pkg import dedupe
+
+    monkeypatch.setattr(runtime, "_REVIEW_FN_OVERRIDE", _review_sync)
+    ctx.config["semantic_dedupe_threshold"] = 0.9
+
+    seen = []
+
+    def fake_ask(a, b, **kw):
+        seen.append((a, b))
+        # Only the SECOND-most-recent finding is a match.
+        return 0.95 if "older issue" in a else 0.05
+
+    monkeypatch.setattr(dedupe, "ask", fake_ask)
+    v = _default(runtime._get_state("s1"))
+    v.recent_findings[:] = ["older issue text", "newer unrelated text"]
+
+    ctx.llm.next = FakeResult({"severity": "caution",
+                               "finding": "older issue text, restated",
+                               "reasoning": ""})
+    _turn(ctx)
+
+    assert v.pending is None, "a paraphrase of an older finding must be suppressed"
+    assert any("older issue" in a for a, _ in seen), \
+        "every retained finding must be compared, not just the newest"
