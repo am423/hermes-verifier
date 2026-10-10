@@ -71,3 +71,25 @@ def test_backlog_does_not_go_negative(ctx):
     ctx.llm.queue = [FakeResult({"severity": "none", "finding": ""})]
     runtime._run_review(state, "delta")
     assert state.backlog == 0
+
+
+def test_thread_registry_is_cleaned_when_the_review_cannot_start(ctx, full_inflight):  # noqa: F811
+    """_schedule_review registers the thread BEFORE starting it.
+
+    If the discard lives only on the post-acquire path, every overflow event
+    leaves a dead Thread in _ACTIVE_REVIEWS permanently. drain_reviews then
+    scans them on every shutdown, and the registry grows without bound.
+    """
+    import threading
+    me = threading.current_thread()
+    with runtime._THREADS_LOCK:
+        runtime._ACTIVE_REVIEWS.add(me)
+    try:
+        state = _state(backlog=1)
+        runtime._run_review(state, "delta")
+        assert me not in runtime._ACTIVE_REVIEWS, (
+            "_ACTIVE_REVIEWS accumulated a dead thread that drain_reviews will "
+            "scan forever"
+        )
+    finally:
+        runtime._ACTIVE_REVIEWS.discard(me)

@@ -699,11 +699,14 @@ def _run_review(state: SessionVerifier, delta_text: str,
                 publish_event("review_finished", {"session_id": state.session_id})
         finally:
             _INFLIGHT.release()
-            with _THREADS_LOCK:
-                _ACTIVE_REVIEWS.discard(threading.current_thread())
     finally:
+        # Both things _schedule_review handed this thread -- the backlog slot and
+        # the registry entry -- are released on EVERY path, so a review that
+        # cannot start leaks neither.
         with _LOCK:
             state.backlog = max(0, state.backlog - 1)
+        with _THREADS_LOCK:
+            _ACTIVE_REVIEWS.discard(threading.current_thread())
 
 
 def _gate_decision(state: SessionVerifier, delta_text: str) -> "gate_mod.GateDecision":
