@@ -639,59 +639,71 @@ def _run_review(state: SessionVerifier, delta_text: str,
     carried through to the finding so the review is accounted to the turn that
     produced it, not the turn that receives it.
     """
-    if _CTX is None:
-        return
-    if not _INFLIGHT.acquire(blocking=False):
-        logger.debug("verifier busy; skipping delta for %s", state.session_id)
-        return
+    # _schedule_review counts this delta into backlog BEFORE starting the
+    # thread, so this thread owns that slot and must consume it on EVERY exit
+    # path, including the two early returns below. Missing them leaked backlog
+    # upward permanently, and because _backlog_wait waits while backlog >=
+    # threshold, a leaked backlog of 1 stalls every later turn for the full
+    # _BACKLOG_WAIT_CAP. The outer try makes that structural rather than a rule
+    # each new early return has to remember.
     try:
-        with _LOCK:
-            state.reviewing = True
-        publish_event("review_started", {"session_id": state.session_id})
+        if _CTX is None:
+            return
+        if not _INFLIGHT.acquire(blocking=False):
+            logger.debug("verifier busy; skipping delta for %s", state.session_id)
+            return
         try:
-            decision = _gate_decision(state, delta_text)
             with _LOCK:
-                state.last_gate = decision
-                state.gate_checked += 1
+                state.reviewing = True
+            publish_event("review_started", {"session_id": state.session_id})
+            try:
+                decision = _gate_decision(state, delta_text)
+                with _LOCK:
+                    state.last_gate = decision
+                    state.gate_checked += 1
+                    if not decision.engage:
+                        state.gate_skipped += 1
+                publish_event("gate_decided", {
+                    "session_id": state.session_id,
+                    "engage": decision.engage,
+                    "effort": decision.tier,
+                    "source": decision.source,
+                })
+                # Persist the decision, INCLUDING a skip. A skipped turn runs no
+                # verifier and so writes no review row, which made "why was this
+                # turn not reviewed?" unanswerable after the fact. The digest
+                # excerpt is the audit trail: it is what the decision was
+                # actually made on.
+                _append_jsonl(_gate_log_path(state.session_id), {
+                    "ts": time.time(),
+                    "session_id": state.session_id,
+                    "origin_turn": origin_turn,
+                    "engage": decision.engage,
+                    "effort": decision.tier,
+                    "source": decision.source,
+                    "digest_excerpt": gate_mod.digest_from_delta(delta_text)[:400],
+                })
+                # A skip ends the cycle here, before any verifier call is paid
+                # for. The finally below still releases the slot, because the
+                # delta has been consumed either way.
                 if not decision.engage:
-                    state.gate_skipped += 1
-            publish_event("gate_decided", {
-                "session_id": state.session_id,
-                "engage": decision.engage,
-                "effort": decision.tier,
-                "source": decision.source,
-            })
-            # Persist the decision, INCLUDING a skip. A skipped turn runs no
-            # verifier and so writes no review row, which made "why was this turn
-            # not reviewed?" unanswerable after the fact. The digest excerpt is
-            # the audit trail: it is what the decision was actually made on.
-            _append_jsonl(_gate_log_path(state.session_id), {
-                "ts": time.time(),
-                "session_id": state.session_id,
-                "origin_turn": origin_turn,
-                "engage": decision.engage,
-                "effort": decision.tier,
-                "source": decision.source,
-                "digest_excerpt": gate_mod.digest_from_delta(delta_text)[:400],
-            })
-            # A skip ends the cycle here, before any verifier call is paid for.
-            # The backlog decrement in the finally block still runs, because the
-            # delta has been consumed either way.
-            if not decision.engage:
-                logger.debug("gate skipped %s (%s)", state.session_id, decision.source)
-                return
-            for verifier in state.enabled_verifiers():
-                _review_one(state, verifier, delta_text,
-                           effort=decision.tier, origin_turn=origin_turn)
+                    logger.debug("gate skipped %s (%s)", state.session_id,
+                                 decision.source)
+                    return
+                for verifier in state.enabled_verifiers():
+                    _review_one(state, verifier, delta_text,
+                                effort=decision.tier, origin_turn=origin_turn)
+            finally:
+                with _LOCK:
+                    state.reviewing = False
+                publish_event("review_finished", {"session_id": state.session_id})
         finally:
-            with _LOCK:
-                state.reviewing = False
-                state.backlog = max(0, state.backlog - 1)
-            publish_event("review_finished", {"session_id": state.session_id})
+            _INFLIGHT.release()
+            with _THREADS_LOCK:
+                _ACTIVE_REVIEWS.discard(threading.current_thread())
     finally:
-        _INFLIGHT.release()
-        with _THREADS_LOCK:
-            _ACTIVE_REVIEWS.discard(threading.current_thread())
+        with _LOCK:
+            state.backlog = max(0, state.backlog - 1)
 
 
 def _gate_decision(state: SessionVerifier, delta_text: str) -> "gate_mod.GateDecision":
