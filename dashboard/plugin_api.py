@@ -167,6 +167,28 @@ def _state_payload() -> Dict[str, Any]:
     }
     payload["primary"] = _primary_model()
     payload["transcript"] = _transcript_from_disk(None, 60)
+    # Cost roll-up: mirrors what /verify status reports, so the two surfaces
+    # cannot disagree. est_tokens is the measured-ratio estimate; input_tokens
+    # is what the provider billed.
+    _sessions = payload.get("sessions") or {}
+    payload["cost"] = {
+        "reviews": sum(int(((v.get("stats") or {}).get("reviews", 0)) or 0)
+                       for s in _sessions.values()
+                       for v in (s.get("verifiers") or {}).values()),
+        "input_tokens": sum(int(((v.get("stats") or {}).get("input_tokens", 0)) or 0)
+                            for s in _sessions.values()
+                            for v in (s.get("verifiers") or {}).values()),
+        "empty_responses": sum(int((s.get("empty_responses", 0)) or 0)
+                               for s in _sessions.values()),
+        "last_est_tokens": max(
+            [int(((v.get("stats") or {}).get("est_tokens", 0)) or 0)
+             for s in _sessions.values()
+             for v in (s.get("verifiers") or {}).values()] or [0]),
+        "last_input_tokens": max(
+            [int(((v.get("stats") or {}).get("last_input_tokens", 0)) or 0)
+             for s in _sessions.values()
+             for v in (s.get("verifiers") or {}).values()] or [0]),
+    }
     payload["last_event_seq"] = (
         runtime.last_event_seq() if runtime is not None else 0
     )

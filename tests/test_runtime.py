@@ -1158,3 +1158,49 @@ def test_pending_reviews_can_be_drained():
     """
     drained = runtime.drain_reviews(timeout=0.01)
     assert isinstance(drained, bool)
+
+
+def test_dashboard_exposes_cost_rollup():
+    """The dashboard /state payload must match /verify status on cost."""
+    import importlib.util
+    import sys
+    import types
+
+    api_path = str(__import__("pathlib").Path(__file__).resolve().parents[1]
+                   / "dashboard" / "plugin_api.py")
+    spec = importlib.util.spec_from_file_location("hv_api_cost", api_path)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["hv_api_cost"] = m
+    spec.loader.exec_module(m)
+
+    m._plugin_settings = lambda: {"enabled": True}
+    m._primary_model = lambda: None
+    m._transcript_from_disk = lambda *a, **k: []
+    # _state_payload resolves the runtime via _runtime(), not a module attr.
+    m._runtime = lambda: types.SimpleNamespace(
+        snapshot=lambda: {
+            "sessions": {
+                "s1": {
+                    "empty_responses": 2,
+                    "verifiers": {
+                        "default": {"stats": {
+                            "reviews": 3,
+                            "input_tokens": 5000,
+                            "est_tokens": 4800,
+                            "last_input_tokens": 1705,
+                        }},
+                    },
+                },
+            },
+            "recent": None,
+            "overrides": {},
+        },
+        last_event_seq=lambda: 0,
+        designated_session=lambda: None,
+    )
+    payload = m._state_payload()
+    cost = payload["cost"]
+    assert cost["reviews"] == 3
+    assert cost["input_tokens"] == 5000
+    assert cost["empty_responses"] == 2
+    assert cost["last_input_tokens"] == 1705
