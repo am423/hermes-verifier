@@ -115,14 +115,35 @@ def _primary_model() -> Dict[str, str]:
     }
 
 
+def _session_slug(session_id: str) -> str:
+    """Mirror runtime._slug_session so the filenames line up exactly."""
+    runtime = _runtime()
+    if runtime is not None and hasattr(runtime, "_slug_session"):
+        return runtime._slug_session(session_id)
+    import re
+    return (re.sub(r"[^A-Za-z0-9._-]+", "_", session_id)[:80]) or "default"
+
+
 def _transcript_from_disk(session_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
     data_dir = _data_dir()
     if not data_dir.is_dir():
         return []
     files = sorted(data_dir.glob("verify.*.jsonl"), key=lambda p: p.stat().st_mtime,
                    reverse=True)
+    # Default to the session in use rather than merging whatever happens to be
+    # on disk: the transcript endpoint is documented as the CURRENT session, and
+    # with no filter it merged up to 8 files from unrelated sessions.
+    if not session_id:
+        runtime = _runtime()
+        session_id = str(runtime.recent_session() or "") if runtime is not None else ""
     if session_id:
-        files = [f for f in files if session_id in f.stem]
+        # The stem is "<session>.<slug>". Match the session part EXACTLY: a
+        # substring test also selected every LONGER id containing this one, so a
+        # short session id silently pulled in unrelated sessions' records.
+        wanted = _session_slug(session_id)
+        files = [f for f in files
+                 if f.stem[len("verify."):].partition(".")[0] == wanted]
+
     records: List[Dict[str, Any]] = []
     for path in files[:8]:
         try:
@@ -134,8 +155,10 @@ def _transcript_from_disk(session_id: Optional[str], limit: int) -> List[Dict[st
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-            if len(records) >= limit:
-                return records[:limit]
+    # Sort globally BEFORE limiting. Returning as soon as one file filled the
+    # limit meant a NEWER record in a different file was silently excluded, so
+    # the view could show stale rows while recent ones existed.
+    records.sort(key=lambda r: r.get("ts") or 0, reverse=True)
     return records[:limit]
 
 

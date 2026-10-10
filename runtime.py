@@ -406,6 +406,16 @@ def _config(ctx: Any, key: str, default: Any) -> Any:
 # Persistence
 # ---------------------------------------------------------------------------
 
+# Per-file ceiling before rotation. Rows are capped at a few KB each, so this
+# holds thousands of reviews -- far more than any UI shows -- while bounding disk
+# in a process that may run for weeks.
+_MAX_LOG_BYTES = 8 * 1024 * 1024
+
+# How much of the tail to read before deciding to widen. Reading the whole file
+# on every dashboard poll was O(file) per poll.
+_TAIL_WINDOW_BYTES = 256 * 1024
+
+
 def _slug_session(session_id: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", session_id)[:80]
     return slug or "default"
@@ -430,6 +440,17 @@ def _gate_log_path(session_id: str) -> Path:
 def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Rotate at a ceiling. These are append-only telemetry rows carrying up
+        # to 2000-char delta excerpts, and nothing ever trimmed them: in a
+        # long-lived gateway the data directory grew for as long as the process
+        # lived. One rotated generation is kept (it does not match the
+        # verify.*.jsonl glob the readers use, so it is history, not live data).
+        try:
+            if path.exists() and path.stat().st_size >= _MAX_LOG_BYTES:
+                path.replace(path.with_name(path.name + ".1"))
+                logger.info("rotated %s at %d bytes", path.name, _MAX_LOG_BYTES)
+        except OSError as exc:
+            logger.warning("could not rotate %s: %s", path, exc)
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError as exc:
@@ -437,16 +458,48 @@ def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
 
 
 def read_jsonl_tail(path: Path, limit: int = 100) -> List[Dict[str, Any]]:
+    """Return the last ``limit`` records without loading the whole file.
+
+    The dashboard polls these files every few seconds, and read_text() loaded and
+    split the entire file on each poll -- O(file size) per request on files that
+    only ever grew.
+    """
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        size = path.stat().st_size
     except OSError:
         return []
+    if size <= _TAIL_WINDOW_BYTES:
+        window, offset = size, 0
+    else:
+        window, offset = _TAIL_WINDOW_BYTES, size - _TAIL_WINDOW_BYTES
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            blob = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = blob.splitlines()
+    if offset and lines:
+        # The window can begin mid-line; that fragment is not a record.
+        lines = lines[1:]
     records: List[Dict[str, Any]] = []
     for line in lines[-limit:]:
         try:
             records.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+    if len(records) < limit and offset:
+        # The window was not wide enough (unusually large rows): widen once.
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return records
+        records = []
+        for line in lines[-limit:]:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     return records
 
 
