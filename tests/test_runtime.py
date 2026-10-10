@@ -1374,3 +1374,25 @@ def test_semantic_dedupe_checks_ALL_recent_findings(ctx, monkeypatch):
     assert v.pending is None, "a paraphrase of an older finding must be suppressed"
     assert any("older issue" in a for a, _ in seen), \
         "every retained finding must be compared, not just the newest"
+
+
+def test_dedupe_recommended_threshold_matches_measurement():
+    """The documented operating point must be the one that was measured.
+
+    Cosine is not a probability, so the decision model's 0.9 must not be carried
+    over: at 0.9 the embedding scores (0.355-0.780 for paraphrases) would suppress
+    nothing at all, silently defeating the stage.
+    """
+    from verifier_pkg import dedupe
+
+    assert dedupe.RECOMMENDED_THRESHOLD == 0.30
+    # The five paraphrase scores measured in sidecar/embed_compare.py.
+    paraphrases = [0.632, 0.355, 0.501, 0.780, 0.585]
+    distinct = [0.114, 0.191, 0.064, 0.074, 0.154]
+    assert all(dedupe.should_suppress(p, threshold=0.30) for p in paraphrases), \
+        "every paraphrase must clear the recommended threshold"
+    assert not any(dedupe.should_suppress(d, threshold=0.30) for d in distinct), \
+        "no distinct pair may clear the recommended threshold"
+    # And the old decision-model threshold really would have broken it.
+    assert not any(dedupe.should_suppress(p, threshold=0.9) for p in paraphrases), \
+        "0.9 on cosine similarity suppresses nothing -- the scales are unrelated"

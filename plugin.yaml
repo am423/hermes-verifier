@@ -71,8 +71,8 @@ config_schema:
   semantic_dedupe_threshold:
     type: float
     default: 0.0
-    description: "Suppress a RESTATED finding the exact-text guard missed, when the local decision model is at least this confident the two describe the same issue. 0 = off. Requires the d1-omni sidecar; unreachable or unsure keeps the finding. Measured: 0 wrongly-suppressed pairs at 0.5-0.95."
+    description: "Suppress a RESTATED finding the exact-text guard missed, when cosine similarity to a recent finding is at least this. 0 = off; 0.30 is the measured operating point (catches 5/5 paraphrases, 0/5 wrongly suppressed). Cosine is NOT a probability. Requires the embedding sidecar; unreachable or below threshold keeps the finding."
   semantic_dedupe_url:
     type: str
-    default: "http://127.0.0.1:8765/same-issue"
-    description: "Endpoint for the semantic-dedupe decision. Empty disables the stage."
+    default: "http://127.0.0.1:8766/similarity"
+    description: "Local sentence-embedding endpoint (sidecar/embed_server.py). Empty disables the stage."

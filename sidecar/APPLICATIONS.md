@@ -226,3 +226,41 @@ recall and zero risk, and effort tiering, both of which work with the model as-i
 3. Implement **shadow sampling** if a gate is still wanted after that — it is
    required for labels *and* it is the only way to see gate errors.
 4. Train only with a real positive-class count and a d1-3B baseline to beat.
+
+---
+
+## SUPERSEDED: dedupe should use an embedder, not the decision model
+
+Following a size review, the semantic-dedupe application was re-implemented
+against a sentence embedder. Same 10 labelled pairs, direct comparison
+(`embed_compare.py`):
+
+| | all-MiniLM-L6-v2 | d1-omni-600M |
+| --- | --- | --- |
+| params | **22.7M** | 587M |
+| on-disk (measured) | **87 MB** | 2.2 GB |
+| separation | **+0.451** | +0.401 |
+| pairwise accuracy | **25/25 = 100%** | 19/25 = 76% |
+| recall at 0 wrong suppressions | **5/5** | 3/5 |
+
+**The 25x smaller model wins on every metric.** The decision model was also the
+wrong tool on principle:
+
+- **206M of its 587M params are vision and audio encoders** this plugin never
+  touches — the card itself splits it as *"381M shared trunk, 94M vision, 112M
+  audio"*. For a text-only plugin that is provably dead weight.
+- It required a bespoke question with hand-written `criteria` that had to be
+  tuned and measured.
+- It required `trust_remote_code`, executing model-supplied Python.
+- Cosine similarity needs none of the above and is deterministic.
+
+**Thresholds do not transfer.** Cosine is a *similarity*, not a probability.
+Paraphrase pairs score 0.355-0.780 and distinct pairs 0.064-0.191, so the
+operating point is **0.30** — the decision model's 0.9 would suppress nothing at
+all, silently defeating the stage. A test pins the recommended threshold against
+the measured scores and asserts 0.9 suppresses nothing, so this cannot regress.
+
+Decision-model artifacts (`probe.py`, `polarity*.py`, `official_pattern.py`,
+`dedupe_probe.py`, `discriminate.py`, `variants.py`, `threshold_check.py`) are
+kept as the evidence trail for why gating was rejected and why the model was
+dropped. `embed_server.py` supersedes `server.py` for the shipped feature.
