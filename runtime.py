@@ -317,6 +317,10 @@ def _log_path(session_id: str, slug: str) -> Path:
     return data_dir() / f"verify.{_slug_session(session_id)}.{slug}.jsonl"
 
 
+def _gate_log_path(session_id: str) -> Path:
+    return data_dir() / f"gate.{_slug_session(session_id)}.jsonl"
+
+
 def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -656,6 +660,19 @@ def _run_review(state: SessionVerifier, delta_text: str,
                 "engage": decision.engage,
                 "effort": decision.tier,
                 "source": decision.source,
+            })
+            # Persist the decision, INCLUDING a skip. A skipped turn runs no
+            # verifier and so writes no review row, which made "why was this turn
+            # not reviewed?" unanswerable after the fact. The digest excerpt is
+            # the audit trail: it is what the decision was actually made on.
+            _append_jsonl(_gate_log_path(state.session_id), {
+                "ts": time.time(),
+                "session_id": state.session_id,
+                "origin_turn": origin_turn,
+                "engage": decision.engage,
+                "effort": decision.tier,
+                "source": decision.source,
+                "digest_excerpt": gate_mod.digest_from_delta(delta_text)[:400],
             })
             # A skip ends the cycle here, before any verifier call is paid for.
             # The backlog decrement in the finally block still runs, because the

@@ -11,6 +11,8 @@ the model answers, and ENGAGE AT DEEP on every conceivable failure.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from verifier_pkg import gate
 
@@ -315,3 +317,63 @@ def test_skip_publishes_a_decision_event(ctx, monkeypatch):
     events = [e for e in runtime.EVENT_LOG if e.get("kind") == "gate_decided"]
     assert events, "the decision must be observable, not silent"
     assert events[-1]["engage"] is False
+
+
+# --------------------------------------------------------------------------
+# the decision must be auditable, including when it says "skip"
+# --------------------------------------------------------------------------
+
+def _gate_rows(session="s"):
+    path = runtime._gate_log_path(session)
+    if not path.exists():
+        return []
+    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+
+def test_a_skip_writes_an_auditable_row(ctx, monkeypatch):
+    """A skipped turn runs no verifier, so without this its absence is unknowable."""
+    ctx.config["gate_enabled"] = True
+    monkeypatch.setattr(runtime, "_GATE_FN_OVERRIDE",
+                        lambda state, delta: gate.GateDecision(False, "routine", "model"))
+    state = runtime.SessionVerifier(session_id="s")
+    state.verifiers["default"] = runtime.Verifier(slug="default", name="d")
+    _review_run(state, "sorted the imports in utils.py")
+
+    rows = _gate_rows("s")
+    assert rows, "a skip must leave a durable trace"
+    assert rows[-1]["engage"] is False
+    assert rows[-1]["effort"] == "routine"
+    assert "sorted the imports" in rows[-1]["digest_excerpt"]
+
+
+def test_an_engage_also_writes_a_row(ctx, monkeypatch):
+    ctx.config["gate_enabled"] = True
+    monkeypatch.setattr(runtime, "_GATE_FN_OVERRIDE",
+                        lambda state, delta: gate.GateDecision(True, "deep", "model"))
+    ctx.llm.queue = [FakeResult({"severity": "none", "finding": ""})]
+    state = runtime.SessionVerifier(session_id="s")
+    state.verifiers["default"] = runtime.Verifier(slug="default", name="d")
+    _review_run(state, "dropped the users table")
+    rows = _gate_rows("s")
+    assert rows and rows[-1]["engage"] is True and rows[-1]["effort"] == "deep"
+
+
+def test_the_row_records_the_producing_turn(ctx, monkeypatch):
+    ctx.config["gate_enabled"] = True
+    monkeypatch.setattr(runtime, "_GATE_FN_OVERRIDE",
+                        lambda state, delta: gate.GateDecision(False, "routine", "model"))
+    state = runtime.SessionVerifier(session_id="s")
+    state.verifiers["default"] = runtime.Verifier(slug="default", name="d")
+    runtime._run_review(state, "typo fix", 4)
+    assert _gate_rows("s")[-1]["origin_turn"] == 4
+
+
+def test_digest_excerpt_is_bounded(ctx, monkeypatch):
+    """The audit row must not grow to the size of the review it avoided."""
+    ctx.config["gate_enabled"] = True
+    monkeypatch.setattr(runtime, "_GATE_FN_OVERRIDE",
+                        lambda state, delta: gate.GateDecision(False, "routine", "model"))
+    state = runtime.SessionVerifier(session_id="s")
+    state.verifiers["default"] = runtime.Verifier(slug="default", name="d")
+    _review_run(state, "z" * 50000)
+    assert len(_gate_rows("s")[-1]["digest_excerpt"]) <= 400
