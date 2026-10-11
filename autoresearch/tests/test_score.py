@@ -117,3 +117,31 @@ def test_the_turn_level_interval_admits_a_survivor_the_cluster_interval_rejects(
     assert not r.get("unscorable"), (
         f"the rejection must be the interval's, not a guard's: {r.get('reason')}"
     )
+
+
+def test_a_rule_firing_in_one_session_cannot_be_adopted():
+    """A rule concentrated in a couple of sessions moves with those sessions'
+    idiosyncrasies; its interval is a statement about them, not about the
+    corpus. This is the coverage guard the measured-optimization skill
+    records -- and it is what the 24-corpus null run showed could still slip
+    through on a lucky draw."""
+    turns = [{"session_id": f"s{s}", "turn": i, "calls": "", "says": "",
+              "edits": 0, "repair_next": (s == 0 and i < 5), "fire": (s == 0)}
+             for s in range(12) for i in range(20)]
+    res = compare_rules(turns, {"ref": lambda t: False, "cand": lambda t: t["fire"]},
+                        reference="ref", bootstraps=200, seed=1)
+    c = res["results"]["cand"]
+    assert c["clears_bar"] is False
+    assert "fires in" in str(c.get("ineligible", ""))
+
+
+def test_a_rule_firing_widely_is_not_ineligible():
+    """Guard the guard: the coverage floor must not label a widely-firing
+    rule ineligible."""
+    turns = [{"session_id": f"s{s}", "turn": i, "calls": "", "says": "",
+              "edits": 0, "repair_next": s % 2 == 0, "fire": s % 2 == 0}
+             for s in range(12) for i in range(20)]
+    res = compare_rules(turns, {"ref": lambda t: t["fire"],
+                                "cand": lambda t: t["fire"]},
+                        reference="ref", bootstraps=200, seed=1)
+    assert "ineligible" not in res["results"]["cand"]

@@ -23,6 +23,11 @@ ALPHA = 0.05
 # a statement about the draws that happened to fire, not about the corpus.
 MAX_UNDEFINED_DRAW_FRACTION = 0.05
 
+# A candidate firing in fewer sessions than this cannot be adopted, however
+# good its interval looks: one session's idiosyncrasy moves the whole estimate,
+# so the interval describes those sessions, not the corpus.
+MIN_FIRING_SESSIONS = 5
+
 
 def lift_ci(turns: List[Dict[str, Any]], predicate: Callable[[Dict[str, Any]], bool],
             bootstraps: int = DEFAULT_BOOTSTRAPS, seed: int = DEFAULT_SEED
@@ -141,11 +146,19 @@ def compare_rules(turns: List[Dict[str, Any]],
             reasons.append("fewer than 2 sessions: no cluster variation")
         if bootstraps and undefined > MAX_UNDEFINED_DRAW_FRACTION * bootstraps:
             reasons.append(f"{undefined}/{bootstraps} cluster draws undefined")
+        firing_sessions = len({str(t.get("session_id"))
+                               for t, m in zip(turns, masks[k]) if m})
         res: Dict[str, Any] = {
             "gap": gap, "ci": ci, "cluster_ci": cluster_ci,
             "clears_bar": bool(cluster_ci[0] is not None and cluster_ci[0] > 0
-                               and not reasons),
+                               and not reasons
+                               and firing_sessions >= MIN_FIRING_SESSIONS),
         }
+        if firing_sessions < MIN_FIRING_SESSIONS:
+            res["ineligible"] = (
+                f"fires in {firing_sessions} session(s), under the "
+                f"{MIN_FIRING_SESSIONS}-session coverage floor"
+            )
         if reasons:
             res["unscorable"] = True
             res["reason"] = "; ".join(reasons)
