@@ -67,6 +67,56 @@ function SeverityChip({ severity }) {
   })
 }
 
+/** Compact token count: 13.3k, 1.2M, 842. */
+function fmtTokens(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return null
+  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}
+
+/** The model that answered, and what the review cost.
+ *  Both ride on every verify.*.jsonl row (`model`, `usage`); the pane simply
+ *  never showed them, so a finding arrived with no way to tell which verifier
+ *  produced it or what it spent. `usage` is absent on older rows, hence the
+ *  null-returns rather than zeroes. */
+function FindingMeta({ record }) {
+  const model = record.model ? String(record.model) : null
+  const usage = record.usage || {}
+  const tin = fmtTokens(usage.input_tokens)
+  const tout = fmtTokens(usage.output_tokens)
+  const cost = Number(usage.cost_usd)
+  const costText = Number.isFinite(cost) && cost > 0 ? `$${cost.toFixed(4)}` : null
+  const tokens = tin || tout
+    ? `${tin || '0'} in / ${tout || '0'} out`
+    : null
+  if (!model && !tokens && !costText) return null
+  const parts = []
+  if (model) parts.push({ key: 'model', text: model, strong: true })
+  if (tokens) parts.push({ key: 'tokens', text: tokens, strong: false })
+  if (costText) parts.push({ key: 'cost', text: costText, strong: false })
+  return jsx('div', {
+    className: 'flex items-center gap-2 text-xs',
+    style: { color: 'var(--ui-text-tertiary)', flexWrap: 'wrap' },
+    children: parts.map((part, i) =>
+      jsxs('span', {
+        key: part.key,
+        className: 'flex items-center gap-2',
+        children: [
+          i > 0
+            ? jsx('span', { style: { opacity: 0.4 }, children: '·' })
+            : null,
+          jsx('span', {
+            style: part.strong ? { color: 'var(--ui-text-secondary)' } : undefined,
+            children: part.text,
+          }),
+        ],
+      })
+    ),
+  })
+}
+
 function FindingCard({ record }) {
   const dimmed = record.accepted === false
   return jsxs('div', {
@@ -94,6 +144,7 @@ function FindingCard({ record }) {
           dimmed ? jsx('span', { className: 'text-xs', children: 'suppressed' }) : null,
         ],
       }),
+      jsx(FindingMeta, { record }),
       jsx('div', {
         className: 'text-sm leading-relaxed whitespace-pre-wrap',
         children: record.finding,
@@ -304,7 +355,12 @@ function FindingsPane({ ctx }) {
 
   const data = stateQuery.data
   const records = (data && data.transcript) || []
-  const entries = [...records].reverse()
+  // MOST RECENT FIRST. This used to be `[...records].reverse()`, which was wrong
+  // twice over: the host already sorts newest-first in `_transcript_from_disk`
+  // (`sort(key=ts, reverse=True)`), so reversing sent the view back to
+  // oldest-first. Sorting here rather than trusting the host's order means the
+  // pane shows the newest review first even if a caller ever changes that.
+  const entries = [...records].sort((a, b) => (Number(b && b.ts) || 0) - (Number(a && a.ts) || 0))
 
   return jsx(ScrollArea, {
     className: 'h-full',
@@ -420,6 +476,13 @@ function VerifierOpenPage({ ctx }) {
 export default {
   id: 'hermes-verifier',
   name: 'Hermes Verifier',
+  // OFF by default, and this flag cannot change that for an installed copy:
+  // `~/.hermes/desktop-plugins/hermes-verifier/` carries .hermes-package.json, so
+  // contrib/runtime-loader.ts:924 sets options.defaultEnabled=false and :523
+  // intersects it with this flag. The real switch is the Desktop column in
+  // Capabilities -> Plugins (NOT Settings -> Plugins, which only opens config
+  // forms); a user choice is stored in localStorage under
+  // hermes.desktop.pluginDecisions.v2 and overrides both defaults.
   defaultEnabled: false,
   register(ctx) {
     ctx.register({
