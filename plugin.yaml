@@ -14,6 +14,7 @@ homepage: https://github.com/am423/hermes-verifier
 tags: [desktop, session, review, verifier]
 provides_hooks:
   - post_llm_call
+  - pre_tool_call
   - pre_llm_call
   - pre_verify
   - on_session_reset
@@ -64,6 +65,14 @@ config_schema:
     type: bool
     default: false
     description: "Let a cheap model call decide whether each turn gets reviewed at all, and at what effort. Measured at ~180 input tokens per decision against ~9,500 for the review it can skip, and validated on 44 labelled cases with 0 dangerous actions skipped. FAIL-SAFE: any error, timeout, empty or unparseable reply engages the review at deep effort. Off by default."
+  phase_gate_enabled:
+    type: bool
+    default: false
+    description: "Review an IMPENDING high-risk tool call and veto it before it runs, instead of commenting after the turn. Fires on irreversible or external actions only (rm -rf, DROP TABLE, force-push, publish/deploy, service restarts) -- MEASURED at ~9-10% of turns, and those turns are followed by repair work 41% of the time against a 24% base rate (1.7x). Fails OPEN: if the gate cannot reach its model, the call proceeds. Off by default."
+  phase_max_per_turn:
+    type: int
+    default: 1
+    description: "Cap on phase-gate checks per turn, so a turn full of risky commands cannot run up unbounded review spend."
   agreement_reviews:
     type: int
     default: 1

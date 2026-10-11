@@ -33,6 +33,7 @@ def register(ctx) -> None:
     runtime.bind_ctx(ctx)
 
     ctx.register_hook("post_llm_call", runtime.handle_post_llm_call)
+    ctx.register_hook("pre_tool_call", runtime.handle_pre_tool_call)
     ctx.register_hook("pre_llm_call", runtime.handle_pre_llm_call)
     ctx.register_hook("pre_verify", runtime.handle_pre_verify)
     ctx.register_hook("on_session_reset", runtime.handle_session_reset)
