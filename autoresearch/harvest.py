@@ -57,7 +57,7 @@ def read_decisions(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
     return out
 
 
-def load_turns(db: pathlib.Path) -> List[Dict[str, Any]]:
+def load_turns(db: pathlib.Path = DEFAULT_DB) -> List[Dict[str, Any]]:
     """Segment every substantial session into turns, with outcome labels."""
     if not db.exists():
         return []

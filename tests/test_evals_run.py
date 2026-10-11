@@ -100,3 +100,15 @@ def test_repeat_chunks_rest_on_the_rep_index_not_on_row_position():
         {"case": b, "rep": 1, "result": _result("caution", "drop the table")},
     ]
     assert m.per_repeat_recall(rows, 2) == [0.5, 1.0]
+
+
+def test_the_stale_optimizers_are_gone_and_the_raw_scorer_shares_the_definitions():
+    """Three copies of the scoring code drifted; the two derived copies are
+    deleted and the survivor imports the rule predicates and the label from
+    autoresearch/ rather than carrying its own stale copies."""
+    assert not (REPO / "evals" / "optimize_rules_ci.py").exists()
+    assert not (REPO / "evals" / "optimize_rules_final.py").exists()
+    src = (REPO / "evals" / "optimize_rules.py").read_text()
+    assert "RAW SCORER" in src, "the raw scorer must carry its banner"
+    assert "from autoresearch.rules import" in src
+    assert "from autoresearch.harvest import" in src
