@@ -19,6 +19,10 @@ DEFAULT_BOOTSTRAPS = 4000
 DEFAULT_SEED = 20261010
 ALPHA = 0.05
 
+# Above this fraction of cluster draws with an undefined side, the interval is
+# a statement about the draws that happened to fire, not about the corpus.
+MAX_UNDEFINED_DRAW_FRACTION = 0.05
+
 
 def lift_ci(turns: List[Dict[str, Any]], predicate: Callable[[Dict[str, Any]], bool],
             bootstraps: int = DEFAULT_BOOTSTRAPS, seed: int = DEFAULT_SEED
@@ -59,28 +63,47 @@ def compare_rules(turns: List[Dict[str, Any]],
                   seed: int = DEFAULT_SEED) -> Dict[str, Any]:
     """Paired bootstrap of every candidate against `reference`.
 
-    Paired: both rules are scored on the SAME resampled turns, so shared noise
-    cancels and the interval is on the actual difference rather than on two
-    independently noisy estimates.
+    Paired: both rules are scored on the SAME resampled corpus per draw, so
+    shared noise cancels and the interval is on the actual difference rather
+    than on two independently noisy estimates.
 
-    A comparison is `unscorable` when either rule's lift is undefined -- the
-    rule never fires, the corpus has no positive labels, or it has no turns.
-    A phantom 0.0 once made a rule that never fired look like a scoreable
-    baseline and reported a candidate's gap as +4.0.
+    Resampling is by SESSION (cluster), not by turn. Turns inside a session
+    share an author, a project and a set of habits, so row-level resampling
+    treats correlated turns as independent evidence and understates the
+    interval -- on a corpus where labels vary by session it admitted a false
+    survivor whose turn-level CI low was +0.086 while the cluster interval
+    rejected it at -0.217. Both intervals are reported (`ci` turn-level,
+    `cluster_ci`); `clears_bar` requires the CLUSTER interval to exclude zero.
+
+    A comparison is `unscorable` when either rule's lift is undefined (the
+    rule never fires, no positive labels, no turns), when there is no cluster
+    variation to resample (fewer than 2 sessions), or when too many cluster
+    draws come back undefined. A phantom 0.0 once made a rule that never fired
+    look like a scoreable baseline and reported a candidate's gap as +4.0.
     """
     rng = random.Random(seed)
     n = len(turns)
+    ids = sorted({str(t.get("session_id")) for t in turns})
+    by_session: Dict[str, List[int]] = {}
+    for i, t in enumerate(turns):
+        by_session.setdefault(str(t.get("session_id")), []).append(i)
     masks = {k: [f(t) for t in turns] for k, f in candidates.items()}
     point = {k: lift_on(turns, m) for k, m in masks.items()}
     positives = sum(1 for t in turns if t.get("repair_next"))
     degenerate = n == 0 or positives == 0 or positives == n
 
     draws: Dict[str, List[Optional[float]]] = {k: [] for k in candidates}
+    cluster_draws: Dict[str, List[Optional[float]]] = {k: [] for k in candidates}
     for _ in range(bootstraps):
         pick = [rng.randrange(n) for _ in range(n)] if n else []
         sub = [turns[i] for i in pick]
         for k, m in masks.items():
             draws[k].append(lift_on(sub, [m[i] for i in pick]))
+        chosen = [ids[rng.randrange(len(ids))] for _ in ids] if ids else []
+        idx = [i for sid in chosen for i in by_session[sid]]
+        csub = [turns[i] for i in idx]
+        for k, m in masks.items():
+            cluster_draws[k].append(lift_on(csub, [m[i] for i in idx]))
 
     n_tests = max(1, len(candidates) - 1)
     lo_q = ALPHA / n_tests / 2
@@ -96,6 +119,15 @@ def compare_rules(turns: List[Dict[str, Any]],
         pair.sort()
         ci = ((pair[int(len(pair) * lo_q)], pair[int(len(pair) * hi_q) - 1])
               if len(pair) >= 2 else (None, None))
+        cpair: List[float] = []
+        for a, b in zip(cluster_draws[k], cluster_draws[reference]):
+            if a is not None and b is not None:
+                cpair.append(a - b)
+        cpair.sort()
+        cluster_ci = ((cpair[int(len(cpair) * lo_q)],
+                       cpair[int(len(cpair) * hi_q) - 1])
+                      if len(cpair) >= 2 else (None, None))
+        undefined = bootstraps - len(cpair)
         gap = (point[k] - point[reference]
                if point[k] is not None and point[reference] is not None else None)
         reasons = []
@@ -105,9 +137,14 @@ def compare_rules(turns: List[Dict[str, Any]],
             reasons.append("reference lift undefined")
         if point[k] is None:
             reasons.append("candidate lift undefined")
+        if len(ids) < 2:
+            reasons.append("fewer than 2 sessions: no cluster variation")
+        if bootstraps and undefined > MAX_UNDEFINED_DRAW_FRACTION * bootstraps:
+            reasons.append(f"{undefined}/{bootstraps} cluster draws undefined")
         res: Dict[str, Any] = {
-            "gap": gap, "ci": ci,
-            "clears_bar": bool(ci[0] is not None and ci[0] > 0 and not reasons),
+            "gap": gap, "ci": ci, "cluster_ci": cluster_ci,
+            "clears_bar": bool(cluster_ci[0] is not None and cluster_ci[0] > 0
+                               and not reasons),
         }
         if reasons:
             res["unscorable"] = True
@@ -131,6 +168,11 @@ def compare_rules(turns: List[Dict[str, Any]],
         "reference_lift": point[reference],
         "point": point,
         "results": results,
+        # The resampling unit and how many of them there are: a cluster
+        # interval is only as trustworthy as the number of clusters.
+        "cluster": {"unit": "session", "sessions": len(ids),
+                    "bootstraps": bootstraps},
         "multiplicity": multiplicity,
         "power": power_of(turns),
+        "seed": seed,
     }
