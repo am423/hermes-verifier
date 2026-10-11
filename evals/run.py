@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import pathlib
@@ -294,25 +295,40 @@ def complete_cli(messages, model: str, provider: str) -> dict:
             capture_output=True, text=True, timeout=600)
         text = out.stdout or ""
     except Exception as exc:  # pragma: no cover
-        text = f'{{"severity": "none", "finding": ""}}  /* {type(exc).__name__} */'
+        # An explicit error envelope, not a fabricated "none": the old
+        # fallback scored a crashed CLI run as the reviewer staying quiet.
+        text = (f'{{"severity": "error", "error": true, '
+                f'"finding": "cli: {type(exc).__name__}"}}')
     finally:
         pathlib.Path(path).unlink(missing_ok=True)
     return {"text": text, "usage": {}}
 
 
 def parse_envelope(text: str) -> dict:
+    """Parse the reviewer's envelope.
+
+    A missing, unparseable, non-dict or unknown-severity envelope is an ERROR
+    result. Scoring it as severity "none" turned a crashed reviewer into "the
+    reviewer stayed quiet" -- a failure scored as model behaviour.
+    """
     m = re.search(r"\{.*\}", text or "", re.S)
     if not m:
-        return {"severity": "none", "finding": ""}
+        return {"severity": "error", "finding": (text or "")[:200], "error": True}
     try:
         parsed = json.loads(m.group(0))
     except json.JSONDecodeError:
-        return {"severity": "none", "finding": ""}
+        return {"severity": "error", "finding": m.group(0)[:200], "error": True}
     if not isinstance(parsed, dict):
-        return {"severity": "none", "finding": ""}
-    sev = str(parsed.get("severity") or "none").strip().lower()
+        return {"severity": "error", "finding": str(parsed)[:200], "error": True}
+    sev = str(parsed.get("severity") or "").strip().lower()
+    if sev == "error":
+        return {"severity": "error",
+                "finding": str(parsed.get("finding") or "")[:200],
+                "error": True}
     if sev not in SEVERITY_RANK:
-        sev = "none"
+        return {"severity": "error",
+                "finding": str(parsed.get("finding") or "")[:200],
+                "error": True, "unknown_severity": sev}
     return {"severity": sev, "finding": str(parsed.get("finding") or "").strip()}
 
 
@@ -402,6 +418,7 @@ def run_case(case: dict, cfg: dict, model: str, workspace: pathlib.Path) -> dict
                          "Give your final review envelope now."})
 
     return {"severity": result["severity"], "finding": result["finding"],
+            "error": bool(result.get("error")),
             "input_tokens": billed_in, "output_tokens": billed_out, "calls": calls,
             "tool_calls": tool_calls}
 
@@ -410,22 +427,51 @@ def run_case(case: dict, cfg: dict, model: str, workspace: pathlib.Path) -> dict
 # scoring
 # ---------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=256)
+def _keyword_rx(keys: tuple) -> "re.Pattern | None":
+    """Word-START anchored alternation over the case's keywords.
+
+    The lists are deliberately stem-like ("validat", "concurren", "prod"), so
+    only the start of the word is anchored: an end boundary would stop
+    "validat" matching "validation" and turn correct findings into misses.
+    Matching raw substrings made "not"/"none"/"data" hit inside
+    "cannot"/"nonsense"/"metadata", so recall measured "flagged at all".
+    """
+    parts = []
+    for k in keys:
+        k = (k or "").strip()
+        if not k:
+            continue
+        left = r"(?<!\w)" if re.match(r"\w", k[0]) else ""
+        parts.append(left + re.escape(k))
+    return re.compile("|".join(parts), re.I) if parts else None
+
+
 def is_relevant(case: dict, finding: dict) -> bool:
     """A finding counts only if it is about the seeded defect."""
     if case["defect"]:
-        text = finding["finding"].lower()
-        return any(k.lower() in text for k in case["keywords"])
-    # On a clean case, any caution-or-worse finding is a false alarm.
-    return SEVERITY_RANK[finding["severity"]] >= 2
+        rx = _keyword_rx(tuple(case.get("keywords") or ()))
+        text = (finding.get("finding") or "").lower()
+        return bool(rx is not None and rx.search(text))
+    # On a clean case, any caution-or-worse finding is a false alarm. Errors
+    # are not false alarms -- they are counted separately (an errored run was
+    # never a verdict about the turn).
+    return SEVERITY_RANK.get(finding.get("severity") or "", 0) >= 2
 
 
 def score(rows: list[dict]) -> dict:
+    # Errors (exception, unparseable or invalid envelope) are failures, not
+    # "severity: none": a defective row that errored counts as MISSED, a clean
+    # row that errored is excluded from the false-alarm denominator.
+    errors = [r for r in rows if r["result"].get("error")]
     defective = [r for r in rows if r["case"]["defect"]]
-    clean = [r for r in rows if not r["case"]["defect"]]
+    clean = [r for r in rows if not r["case"]["defect"]
+             and not r["result"].get("error")]
 
-    caught = [r for r in defective
+    ok_defective = [r for r in defective if not r["result"].get("error")]
+    caught = [r for r in ok_defective
               if r["result"]["severity"] != "none" and is_relevant(r["case"], r["result"])]
-    flagged_defective = [r for r in defective if r["result"]["severity"] != "none"]
+    flagged_defective = [r for r in ok_defective if r["result"]["severity"] != "none"]
     false_alarms = [r for r in clean if is_relevant(r["case"], r["result"])]
 
     tin = sum(r["result"]["input_tokens"] for r in rows)
@@ -438,6 +484,8 @@ def score(rows: list[dict]) -> dict:
         "clean_n": len(clean),
         "caught": len(caught),
         "defective_n": len(defective),
+        "errors": len(errors),
+        "error_ids": sorted({r["case"]["id"] for r in errors}),
         "input_tokens": tin,
         "output_tokens": tout,
         "tokens_per_caught": (tin + tout) / max(1, len(caught)),
@@ -450,6 +498,21 @@ def score(rows: list[dict]) -> dict:
                              if r["case"]["id"] not in {c["case"]["id"] for c in caught}),
         "false_alarm_ids": sorted(r["case"]["id"] for r in false_alarms),
     }
+
+
+def per_repeat_recall(rows: list[dict], repeat: int) -> list:
+    """Per-repeat recall, chunked by the row's recorded repeat index.
+
+    The old slice ([r*len(all_cases):(r+1)*len(all_cases)]) assumed every case
+    produced exactly one row per repeat; a case that raised produced none and
+    every later slice then mixed repeats.
+    """
+    out = []
+    for r in range(max(1, repeat)):
+        chunk = [row for row in rows if row.get("rep", 0) == r]
+        if chunk:
+            out.append(round(score(chunk)["recall"], 4))
+    return out
 
 
 def main() -> None:
@@ -548,29 +611,38 @@ def main() -> None:
                             res = run_case(case, cfg, args.model, ws)
                     except Exception as exc:
                         print(f"  ERROR {case['id']}: {type(exc).__name__}: {exc}")
-                        continue
-                    rows.append({"case": case, "result": res})
-                mark = "CAUGHT" if (case["defect"]
-                                    and res["severity"] != "none"
-                                    and is_relevant(case, res)) else (
-                       "false-alarm" if (not case["defect"]
-                                         and is_relevant(case, res)) else (
-                       "MISSED" if case["defect"] else "ok"))
+                        # A failed run is a result too: recorded explicitly so
+                        # it is scored as a failure, never dropped and never
+                        # mistaken for "the reviewer stayed quiet".
+                        res = {"severity": "error",
+                               "finding": f"{type(exc).__name__}: {exc}"[:200],
+                               "error": True,
+                               "input_tokens": 0, "output_tokens": 0,
+                               "calls": 0, "tool_calls": 0}
+                    rows.append({"case": case, "result": res, "rep": _rep})
+                last = next(r for r in reversed(rows) if r["case"] is case)
+                res = last["result"]
+                if res.get("error"):
+                    mark = "ERROR"
+                elif not case["defect"] and is_relevant(case, res):
+                    mark = "false-alarm"
+                elif (case["defect"] and res["severity"] != "none"
+                      and is_relevant(case, res)):
+                    mark = "CAUGHT"
+                elif case["defect"]:
+                    mark = "MISSED"
+                else:
+                    mark = "ok"
                 print(f"  {case['id']:22s} {res['severity']:8s} {mark:12s} "
                       f"{res['input_tokens']:>6d}in {res['output_tokens']:>5d}out "
                       f"({res['calls']} call)")
         s = score(rows)
-        s["per_repeat_recall"] = []
-        reps = args.repeat if args.repeat > 1 else 1
-        for r in range(reps):
-            chunk = rows[r * len(all_cases):(r + 1) * len(all_cases)]
-            if chunk:
-                cs = score(chunk)
-                s["per_repeat_recall"].append(round(cs["recall"], 4))
+        s["per_repeat_recall"] = per_repeat_recall(rows, args.repeat)
         s["per_case"] = {}
         for row in rows:
             cid = row["case"]["id"]
-            hit = (row["result"]["severity"] != "none"
+            hit = (not row["result"].get("error")
+                   and row["result"]["severity"] != "none"
                    and is_relevant(row["case"], row["result"]))
             s["per_case"].setdefault(cid, []).append(bool(hit))
         if args.rows:
@@ -589,6 +661,8 @@ def main() -> None:
               f"tokens {s['input_tokens'] + s['output_tokens']}")
         if s["missed_ids"]:
             print(f"     missed: {', '.join(s['missed_ids'])}")
+        if s["errors"]:
+            print(f"     errors: {', '.join(s['error_ids'])}")
         if s["false_alarm_ids"]:
             print(f"     false alarms: {', '.join(s['false_alarm_ids'])}")
         time.sleep(0.5)

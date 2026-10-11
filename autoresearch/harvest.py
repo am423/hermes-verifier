@@ -5,7 +5,9 @@ Two sources, one shape:
   * what the agent actually did (state.db messages), segmented into turns
 
 A "turn" starts at a user message and runs until the next one. The outcome label
-is computed from the FOLLOWING turn.
+(`repair_next`) is computed from the FOLLOWING turn's assistant PROSE only;
+`repair_next_any` keeps the older, broad reading (prose + tool args + tool
+results) so the two can be compared.
 """
 
 from __future__ import annotations
@@ -27,10 +29,15 @@ def read_decisions(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
     A torn final line (the process died mid-append) is skipped rather than
     raising: these files are appended to by a daemon thread, and the loop must
     not fall over on the last row.
+
+    Rows the plugin wrote carry their own session_id; when one is missing
+    (hand-written fixtures, older rows) the filename is the fallback --
+    `gate.<session>.jsonl` names the session the row belongs to.
     """
     out: List[Dict[str, Any]] = []
     for kind in ("gate", "phase", "agreement"):
         for path in sorted(data_dir.glob(f"{kind}.*.jsonl")):
+            file_session = path.stem.partition(".")[2]
             try:
                 text = path.read_text(errors="replace")
             except OSError:
@@ -44,24 +51,31 @@ def read_decisions(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
                     continue
                 if isinstance(row, dict):
                     row["kind"] = kind
+                    if not row.get("session_id"):
+                        row["session_id"] = file_session
                     out.append(row)
     return out
 
 
-def load_turns(db: pathlib.Path) -> List[Dict[str, Any]]:
+def load_turns(db: pathlib.Path = DEFAULT_DB) -> List[Dict[str, Any]]:
     """Segment every substantial session into turns, with outcome labels."""
     if not db.exists():
         return []
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
+    # active=0 rows were compacted away or rewound by the user; the host's own
+    # reader hides them, and the analysis must too. Older DBs have no such
+    # column, so guard before filtering rather than breaking the loop.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(messages)")}
+    active = " and active=1" if "active" in cols else ""
     sessions = [r["session_id"] for r in con.execute(
-        "select session_id from messages where role in ('assistant','tool') "
-        "group by session_id having count(*) >= 20")]
+        "select session_id from messages where role in ('assistant','tool')"
+        + active + " group by session_id having count(*) >= 20")]
     out: List[Dict[str, Any]] = []
     for sid in sessions:
         rows = list(con.execute(
             "select role, content, tool_calls from messages "
-            "where session_id=? order by id", (sid,)))
+            "where session_id=?" + active + " order by id", (sid,)))
         turns: List[Dict[str, Any]] = []
         cur: Dict[str, Any] = None  # type: ignore[assignment]
         for r in rows:
@@ -79,28 +93,47 @@ def load_turns(db: pathlib.Path) -> List[Dict[str, Any]]:
         if len(turns) < 6:
             continue
         for i, t in enumerate(turns):
-            nxt = ""
+            nxt_prose = ""
+            nxt_any = ""
             if i + 1 < len(turns):
-                nxt = (" ".join(turns[i + 1]["says"]) + "\n"
-                       + "\n".join(turns[i + 1]["calls"]))
+                nxt_prose = " ".join(turns[i + 1]["says"])
+                nxt_any = nxt_prose + "\n" + "\n".join(turns[i + 1]["calls"])
             out.append({
-                "session_id": sid, "turn": i,
+                # 1-based, so it is directly comparable to a decision row's
+                # own `origin_turn`.
+                "session_id": sid, "turn": i + 1,
                 "calls": "\n".join(t["calls"]), "says": "\n".join(t["says"]),
                 "edits": t["edits"],
-                "repair_next": bool(REPAIR.search(nxt)) if nxt else False,
-                "fail_next": bool(FAILURE.search(nxt)) if nxt else False,
+                # Prose only. Including tool args and results made the label a
+                # proxy for "the next turn ran tests or printed repo text".
+                "repair_next": bool(REPAIR.search(nxt_prose)) if nxt_prose else False,
+                # The old, broad reading (prose + tool args + tool results),
+                # kept so the two labels can be compared.
+                "repair_next_any": bool(REPAIR.search(nxt_any)) if nxt_any else False,
+                "fail_next": bool(FAILURE.search(nxt_any)) if nxt_any else False,
             })
     return out
 
 
 def harvest(data_dir: pathlib.Path = DEFAULT_DATA,
             db: pathlib.Path = DEFAULT_DB) -> List[Dict[str, Any]]:
-    """Turns, with any decisions that belong to the same session attached."""
+    """Turns, with the decisions made ON each turn attached.
+
+    Attaching every decision of a session to every turn of that session (what
+    this used to do) copied the same rows onto all 118 turns of a session and
+    made any join meaningless.
+    """
     turns = load_turns(db)
     decisions = read_decisions(data_dir)
-    by_session: Dict[str, List[Dict[str, Any]]] = {}
+    by_turn: Dict[tuple, List[Dict[str, Any]]] = {}
     for d in decisions:
-        by_session.setdefault(str(d.get("session_id") or ""), []).append(d)
+        try:
+            origin = int(d.get("origin_turn") or 0)
+        except (TypeError, ValueError):
+            origin = 0
+        if origin < 1:
+            continue        # no turn attribution; the raw logs keep it
+        by_turn.setdefault((str(d.get("session_id") or ""), origin), []).append(d)
     for t in turns:
-        t["decisions"] = by_session.get(t["session_id"], [])
+        t["decisions"] = by_turn.get((t["session_id"], t["turn"]), [])
     return turns

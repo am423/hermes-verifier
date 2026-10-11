@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 from autoresearch.score import compare_rules, lift_ci
 
 
@@ -44,3 +46,110 @@ def test_the_multiplicity_bar_widens_with_the_number_of_candidates():
     assert many["multiplicity"]["alpha_each"] < one["multiplicity"]["alpha_each"], (
         "more candidates must mean a stricter bar, or the pass manufactures winners"
     )
+
+
+def test_an_undefined_baseline_is_unscorable():
+    """lift_on returned 0.0 for a rule that never fires, so a candidate was
+    scored against a phantom zero and reported gap +4.0 with a CI of
+    (3.42, 4.88). "Never fires" has no lift; it must not be a scoreable
+    baseline."""
+    turns = _turns(20, 20)
+    res = compare_rules(turns, {"always": lambda t: False,
+                                "never": lambda t: True},
+                        reference="always", bootstraps=100, seed=1)
+    assert res["results"]["never"]["clears_bar"] is False
+    assert res["results"]["never"].get("unscorable") is True
+
+
+def test_the_bootstrap_resamples_sessions_not_turns():
+    """Turns inside a session share an author and a project, so row-level
+    resampling understates uncertainty. On a corpus where labels vary BY SESSION
+    and the rule fires concentrated in a few sessions, the turn-level interval
+    admitted a false survivor that the cluster interval rejected."""
+    turns = []
+    for s in range(10):
+        rate = 0.8 if s < 3 else 0.1          # labels vary by session
+        hot = s < 3                            # rule fires in a few sessions
+        for i in range(40):
+            turns.append({"session_id": f"s{s}", "turn": i, "calls": "", "says": "",
+                          "edits": 0, "repair_next": (i % 10) < rate * 10,
+                          "fire": hot})
+    res = compare_rules(turns, {"ref": lambda t: t["fire"],
+                                "cand": lambda t: t["fire"]},
+                        reference="ref", bootstraps=200, seed=1)
+    assert "cluster" in res, "the result must expose a cluster-level interval"
+
+
+def _session_rate_corpus(seed, n_sessions=12, turns_per=30):
+    """Labels that vary BY SESSION: each session draws its own label rate, so
+    turns inside a session are correlated, and each rule fires on whole
+    sessions -- the confound the cluster bootstrap exists for."""
+    rng = random.Random(seed)
+    rates = [rng.choice([0.05, 0.35, 0.85]) for _ in range(n_sessions)]
+    fire_a = rng.sample(range(n_sessions), 5)
+    fire_b = rng.sample(range(n_sessions), 5)
+    turns = []
+    for s in range(n_sessions):
+        for i in range(turns_per):
+            turns.append({
+                "session_id": f"s{s}", "turn": i + 1, "calls": "", "says": "",
+                "edits": 0,
+                "repair_next": rng.random() < rates[s],
+                "fire_a": s in fire_a, "fire_b": s in fire_b,
+            })
+    return turns
+
+
+def test_the_turn_level_interval_admits_a_survivor_the_cluster_interval_rejects():
+    """The demonstrated case: on a session-correlated corpus the turn-level
+    interval's low end is above zero (+0.076) while the session-cluster
+    interval -- the honest one, because turns share a session -- still spans
+    zero (low -0.732). clears_bar must follow the cluster interval, and the
+    rejection must come from the interval, not from a guard."""
+    turns = _session_rate_corpus(seed=1)
+    res = compare_rules(turns, {"ref": lambda t: t["fire_a"],
+                                "cand": lambda t: t["fire_b"]},
+                        reference="ref", bootstraps=200, seed=1)
+    r = res["results"]["cand"]
+    assert r["ci"][0] > 0, f"turn-level interval was {r['ci']}"
+    assert r["cluster_ci"][0] < 0, f"cluster interval was {r['cluster_ci']}"
+    assert r["clears_bar"] is False
+    assert not r.get("unscorable"), (
+        f"the rejection must be the interval's, not a guard's: {r.get('reason')}"
+    )
+
+
+def test_a_rule_firing_in_one_session_cannot_be_adopted():
+    """A rule concentrated in a couple of sessions moves with those sessions'
+    idiosyncrasies; its interval is a statement about them, not about the
+    corpus. This is the coverage guard the measured-optimization skill
+    records -- and it is what the 24-corpus null run showed could still slip
+    through on a lucky draw."""
+    turns = [{"session_id": f"s{s}", "turn": i, "calls": "", "says": "",
+              "edits": 0, "repair_next": (s == 0 and i < 5), "fire": (s == 0)}
+             for s in range(12) for i in range(20)]
+    res = compare_rules(turns, {"ref": lambda t: False, "cand": lambda t: t["fire"]},
+                        reference="ref", bootstraps=200, seed=1)
+    c = res["results"]["cand"]
+    assert c["clears_bar"] is False
+    assert "fires in" in str(c.get("ineligible", ""))
+
+
+def test_a_rule_firing_widely_is_not_ineligible():
+    """Guard the guard: the coverage floor must not label a widely-firing
+    rule ineligible."""
+    turns = [{"session_id": f"s{s}", "turn": i, "calls": "", "says": "",
+              "edits": 0, "repair_next": s % 2 == 0, "fire": s % 2 == 0}
+             for s in range(12) for i in range(20)]
+    res = compare_rules(turns, {"ref": lambda t: t["fire"],
+                                "cand": lambda t: t["fire"]},
+                        reference="ref", bootstraps=200, seed=1)
+    assert "ineligible" not in res["results"]["cand"]
+
+
+def test_no_turns_is_unscorable_not_a_crash():
+    """Empty input must produce a refusal, not a traceback and not a score."""
+    res = compare_rules([], {"a": lambda t: True, "b": lambda t: False},
+                        reference="a", bootstraps=10, seed=1)
+    assert res["results"]["b"]["clears_bar"] is False
+    assert res["results"]["b"]["unscorable"] is True
