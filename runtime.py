@@ -567,7 +567,8 @@ def _call_structured(ctx: Any, *, system_prompt: str, instructions: str,
                      model: Optional[str], max_tokens: Optional[int] = None,
                      json_schema: Optional[Dict[str, Any]] = None,
                      schema_name: str = "verifier_review",
-                     purpose: str = "hermes-verifier review") -> Any:
+                     purpose: str = "hermes-verifier review",
+                     timeout: float = 120.0) -> Any:
     from agent.plugin_llm import PluginLlmTrustError  # noqa: F401
 
     kwargs: Dict[str, Any] = dict(
@@ -578,7 +579,7 @@ def _call_structured(ctx: Any, *, system_prompt: str, instructions: str,
         schema_name=schema_name,
         system_prompt=system_prompt,
         purpose=purpose,
-        timeout=120.0,
+        timeout=timeout,
     )
     if max_tokens:
         kwargs["max_tokens"] = max_tokens
@@ -1161,6 +1162,15 @@ def _run_review(state: SessionVerifier, delta_text: str,
 # than as code that performs them.
 # ---------------------------------------------------------------------------
 
+# The host bounds every pre_tool_call callback at plugins.hook_callback_timeout
+# (30 s) and turns a timeout -- or ANY exception escaping the callback -- into a
+# BLOCK directive. The gate's model call must finish well inside that budget; it
+# was allowed 120 s, four times the limit, so a slow provider produced exactly
+# what the design forbids: a blocked `git push`, with the durable row recording
+# `allow` for an action that was actually blocked.
+_PHASE_TIMEOUT = 8.0
+
+
 _PHASE_RISK: "List[tuple]" = []
 
 
@@ -1230,18 +1240,26 @@ def handle_pre_tool_call(tool_name: Any = "", args: Any = None,
     session_id = key
     if not session_id or not subsystem_enabled(session_id):
         return None
-    label = _action_is_high_risk(str(tool_name), args)
-    if label is None:
-        return None
-    state = _get_state(session_id)
-    if state is None:
-        return None
-    cap = safe_int(_config(_CTX, "phase_max_per_turn", 1), 1)
-    with _LOCK:
-        if cap and state.phase_checks >= cap:
+    try:
+        label = _action_is_high_risk(str(tool_name), args)
+        if label is None:
             return None
-        state.phase_checks += 1
-    return _pre_review_action(state, str(tool_name), args, label)
+        state = _get_state(session_id)
+        if state is None:
+            return None
+        cap = safe_int(_config(_CTX, "phase_max_per_turn", 1), 1)
+        with _LOCK:
+            if cap and state.phase_checks >= cap:
+                return None
+            state.phase_checks += 1
+        return _pre_review_action(state, str(tool_name), args, label)
+    except Exception as exc:
+        # The host converts ANY exception escaping this callback into a block
+        # directive, so a bug in the detector would stop the user's work. A gate
+        # that cannot decide must allow.
+        logger.warning("phase gate handler raised (%s: %s); allowing",
+                       type(exc).__name__, exc)
+        return None
 
 
 def _pre_review_action(state: SessionVerifier, tool_name: str, args: Any,
@@ -1258,9 +1276,21 @@ def _pre_review_action(state: SessionVerifier, tool_name: str, args: Any,
     provider, model = _resolve_model_for(ctx, verifier)
     try:
         payload = json.dumps({"tool": tool_name, "args": args},
-                             ensure_ascii=False)[:2000]
+                             ensure_ascii=False)
     except (TypeError, ValueError):
-        payload = str(args)[:2000]
+        payload = str(args)
+    # Redact BEFORE the model sees it and before it is written to
+    # phase.<session>.jsonl. Every other model-bound path in this plugin redacts
+    # (delta.redact, and brief.py promises the reviewer "you never see
+    # secrets"); the phase gate was added later and did neither, so a command
+    # like `git push https://x-access-token:<token>@host/...` -- which the gate
+    # matches on the `git push` substring -- shipped the credential to the
+    # provider and to disk.
+    #
+    # Redact THEN truncate. Truncating first can cut a key below the length its
+    # pattern needs to match, which is how the delta path once shipped a private
+    # key body intact.
+    payload = delta_mod.redact(payload)[:2000]
 
     system = (
         "You gate an AI agent's impending tool call. It has NOT run yet.\n"
@@ -1278,10 +1308,19 @@ def _pre_review_action(state: SessionVerifier, tool_name: str, args: Any,
             input_text=payload, provider=provider, model=model,
             json_schema=PHASE_SCHEMA, schema_name="verifier_phase_gate",
             purpose="hermes-verifier phase gate",
+            timeout=_PHASE_TIMEOUT,
         )
     except Exception as exc:
         # Fail OPEN. A gate that cannot reach its model must never stop the
         # user's work; an unavailable gate is not a blocker.
+        # Durable: a gate that could not answer is exactly when it silently
+        # stopped protecting, and the loop needs to see that.
+        _append_jsonl(_decision_log_path("phase", state.session_id), {
+            "ts": time.time(), "session_id": state.session_id,
+            "origin_turn": state.turns_seen, "tool": tool_name, "risk": label,
+            "verdict": "error", "args_excerpt": payload[:400],
+            "error": f"{type(exc).__name__}: {exc}"[:200],
+        })
         logger.warning("phase gate unavailable for %s: %s", state.session_id, exc)
         return None
 
