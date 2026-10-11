@@ -80,7 +80,15 @@ def _data_dir() -> Path:
 
         return plugin_data_dir(_PLUGIN_ID)
     except Exception:
-        return Path.home() / ".hermes" / "plugin-data" / _PLUGIN_ID
+        # Use the host's accessor when present: HERMES_HOME is configurable, and
+        # a hardcoded ~/.hermes silently reads the wrong tree on such an install
+        # (the reviewer's optional item on NousResearch/hermes-agent#135996).
+        try:
+            from hermes_constants import get_hermes_home
+            root = Path(get_hermes_home())
+        except Exception:
+            root = Path.home() / ".hermes"
+        return root / "plugin-data" / _PLUGIN_ID
 
 
 def _config() -> Dict[str, Any]:

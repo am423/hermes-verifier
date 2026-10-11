@@ -682,7 +682,10 @@ def test_nudge_injected_on_early_turns(ctx):
         session_id="s1", user_message="build the thing",
         conversation_history=[], is_first_turn=True)
     assert injected is not None
-    assert "advisor" in injected["context"].lower()
+    # Against the constant, not a word from it: the exact wording is allowed to
+    # change (the reviewer asked for a reword), while "the nudge was injected"
+    # is the contract. Pinning a noun made a doc fix look like a regression.
+    assert runtime.NUDGE_TEXT in injected["context"]
 
 
 def test_nudge_not_injected_when_disabled(ctx):
@@ -999,7 +1002,7 @@ def test_nudge_and_pending_finding_both_delivered(ctx, monkeypatch):
     injected = runtime.handle_pre_llm_call(session_id="s1", user_message="m",
                                            conversation_history=[])
     assert injected is not None
-    assert "advisor" in injected["context"].lower(), "the nudge must be present"
+    assert runtime.NUDGE_TEXT in injected["context"], "the nudge must be present"
     assert "credential leak" in injected["context"], "the finding must be present"
 
 

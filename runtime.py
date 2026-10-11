@@ -43,10 +43,14 @@ DEFAULT_VERIFIER = "default"
 # Claude Code found a turn-2 consultation reminder raised Haiku pass rates by
 # ~7pp, had no measurable effect on Sonnet, and slightly lowered Opus rates.
 # Ported with that caveat attached, and off by default.
+# Reworded (reviewer's optional item). The old text instructed the primary agent
+# how to behave and implied the verifier had checked things it may not have. This
+# states what is true: it reviews independently, it cannot act, and a finding is
+# something to weigh rather than an instruction.
 NUDGE_TEXT = (
-    "You have an independent advisor available. Before committing to an approach "
-    "for this task, consider consulting it — it is most useful for non-obvious "
-    "design decisions and failure modes you have not yet ruled out."
+    "A verifier is reviewing this session independently. It may raise findings as "
+    "you work; it cannot run tools or edit files, so treat what it says as another "
+    "opinion to weigh, not as a check that has already been performed."
 )
 
 # /ask asks a QUESTION, so it must not reuse REVIEW_SCHEMA: that schema demands a
