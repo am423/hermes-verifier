@@ -88,6 +88,8 @@ def validate(turns: List[Dict[str, Any]], candidates: Dict[str, Callable], *,
             "held_out": {},
             "adoptable": [],
             "multiplicity": None,
+            "fit_results": {},
+            "deciding_half": None,
         }
 
     fit_res = compare_rules(fit, candidates, reference=reference,
@@ -138,4 +140,10 @@ def validate(turns: List[Dict[str, Any]], candidates: Dict[str, Callable], *,
         "held_out": held_out,
         "adoptable": adoptable,
         "multiplicity": fit_res["multiplicity"],
+        # The full fit-half candidate table, so the report can show every
+        # candidate's cluster interval -- not only the survivors'.
+        "fit_results": fit_res["results"],
+        # Which half decided: the validation half when anything survived the
+        # fit bar; otherwise the fit half (nothing cleared it).
+        "deciding_half": "validation" if survivors else "fit",
     }
