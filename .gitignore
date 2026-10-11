@@ -8,3 +8,11 @@ node_modules/
 .hook_outputs/
 tests/_pkg/
 .pytest_cache/
+
+# Agent working files and generated reports -- not product output.
+.hermes/plans/
+autoresearch/reports/
+sidecar/.venv/
+
+# The sidecar brief is loaded from ../brief.py now; a copy drifts.
+sidecar/verifier_pkg_brief.py

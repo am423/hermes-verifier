@@ -15,8 +15,28 @@ This reproduces the REAL composed prompt against the REAL provider.
 import json, re, sys, urllib.request
 from llm_gate import load_key
 
-sys.path.insert(0, ".")
-from verifier_pkg_brief import SYSTEM_PROMPT, REVIEW_TASK  # noqa
+# Load the LIVE brief, not a copy. This file imported `verifier_pkg_brief`, a
+# sidecar duplicate that had drifted 111 lines behind brief.py -- so the test
+# reproduced a prompt the plugin no longer ships, and a passing run said nothing
+# about the shipped reviewer. Same _load trick evals/run.py uses for the same
+# reason. The duplicate is deleted.
+import importlib.util, pathlib
+
+_REPO = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_VERIFIER_PKG = {"verifier_pkg": type(sys)("verifier_pkg")}
+sys.modules.setdefault("verifier_pkg", _VERIFIER_PKG["verifier_pkg"])
+_brief = _load(_REPO / "brief.py", "hv_brief")
+SYSTEM_PROMPT, REVIEW_TASK = _brief.SYSTEM_PROMPT, _brief.REVIEW_TASK
 
 TOOL_BLOCK = (
     "You may verify claims with these read-only tools:\n"
