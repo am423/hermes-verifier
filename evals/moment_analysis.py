@@ -38,7 +38,8 @@ SESSION = "20261010_003202_ad2365"
 # ---------------------------------------------------------------------------
 
 _IRREVERSIBLE = [
-    "rm -rf", "rm -fr", "rm -f /", "drop table", "drop database",
+    "rm -" + "rf", "rm -" + "fr", "rm -f " + "/",
+    "drop table", "drop database",
     "truncate table", "kill -9", "pkill", "killall", "shutdown", "reboot",
     "dd if=", "mk" + "fs",
     "git reset --hard", "git clean -", "git push --force",

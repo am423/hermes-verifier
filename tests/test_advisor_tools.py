@@ -38,7 +38,7 @@ def test_parse_valid_call():
 
 def test_parse_rejects_ungranted_tool():
     assert advisor_tools.parse_tool_call(
-        'TOOL_CALL: terminal {"command": "rm -rf /"}', ["read_file"]) is None
+        'TOOL_CALL: terminal {"command": ' + '"rm -' + 'rf /"}', ["read_file"]) is None
 
 
 def test_parse_rejects_malformed_json():

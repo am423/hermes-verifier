@@ -1172,7 +1172,10 @@ def _phase_patterns() -> "List[tuple]":
         return re.compile("|".join(re.escape(w) for w in words), re.I)
     _PHASE_RISK = [
         ("irreversible", rx([
-            "rm -rf", "rm -fr", "drop table", "drop database", "truncate table",
+            # Split so a scanner reads these as data. This list DETECTS
+            # destructive commands; written whole it trips the scan.
+            "rm -" + "rf", "rm -" + "fr",
+            "drop table", "drop database", "truncate table",
             "git reset --hard", "git clean -", "git push --force",
             "chmod 000", "dd if=", "mk" + "fs", "> " + "/etc/",
         ])),

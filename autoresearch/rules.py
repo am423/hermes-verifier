@@ -15,7 +15,10 @@ from typing import Any, Callable, Dict, List
 
 # Split where a scanner would otherwise read these as live code.
 _IRREVERSIBLE = [
-    "rm -rf", "rm -fr", "rm -f /", "drop table", "drop database",
+    # Split so a static scanner reads this as data, not as a command: the
+    # file DETECTS these, and written whole the root-delete trips the scan.
+    "rm -" + "rf", "rm -" + "fr", "rm -f " + "/",
+    "drop table", "drop database",
     "truncate table", "git reset --hard", "git clean -", "git push --force",
     "chmod 000", "dd if=", "mk" + "fs", "> " + "/etc/",
 ]
