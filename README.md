@@ -2,28 +2,36 @@
 
 A desktop plugin for [Hermes Agent](https://hermes-agent.nousresearch.com/) that attaches
 an independent **verifier** to your session. The verifier is a second model that reviews
-each update to the primary agent's transcript, inspects the workspace with its own
-read-only tools, and raises **findings** that get steered back into the session before
-the primary agent runs off a cliff.
+each update to the primary agent's transcript and raises **findings** that get steered
+back into the session before the primary agent runs off a cliff. (A read-only tool grant
+for claim-checking exists, but it is opt-in and measured near-inert — see
+[Advisor tools](#advisor-tools-and-their-limits).)
 
 ## What it does
 
 - **Second-opinion review** — every primary turn delta is rendered (reasoning, tool
   intent, tool results) and sent to the verifier model you choose.
-- **Findings, not control** — the verifier never mutates session state. It raises
-  findings with one of three severities:
-  - `note` — a non-blocking aside, batched into the transcript at the next step boundary.
-  - `caution` — an interrupting steer: material risk, wrong direction, hallucinated API.
-  - `blocker` — the work is headed somewhere broken; the session pauses for you.
-- **Read-only by default** — the verifier's default grant is `read_file`,
-  `search_files`, and `glob`-style file search. Roster entries may widen the grant,
-  but never by default.
+- **Findings, not control** — the verifier never mutates session state and nothing it
+  does pauses the session. It raises findings with one of three severities:
+  - `note` — a non-blocking aside, injected with the next turn's context.
+  - `caution` — material risk, wrong direction, hallucinated API; delivered with the
+    next turn's context (no mid-turn interruption).
+  - `blocker` — the work is headed somewhere broken, and the only severity that can
+    steer: a pending blocker keeps a coding turn alive via the pre-verify gate
+    (bounded by `immunity_turns` and `blocker_steer`).
+- **Tools off by default** — `advisor_tools` defaults `false` and `default_tools`
+  defaults `[]`, so a verifier starts with no tool grant at all. When the feature is
+  enabled, only `read_file` and `search_files` can be granted (the latter does the
+  glob-style file search), and a roster entry may grant them to its own verifier.
 - **Review briefs** — drop a `VERIFIER.md` in a project (or `~/.hermes/`) to tell the
   verifier what to watch for: dangerous APIs, architectural boundaries, quality bars.
   A `VERIFIER.yml` roster declares named verifiers with their own model, tool grant,
   and specialization.
-- **Clean delivery** — an emission guard normalizes, dedupes, and rate-limits findings
-  so the verifier never nags.
+- **Clean delivery — with measured limits** — an emission guard normalizes, dedupes,
+  and rate-limits findings, but it is not a no-nag guarantee: false-alarm rates
+  measured **44–100%** across this project's configurations (one exception: the
+  3-of-3 agreement filter on deepseek at 17%, which kept 72% of findings). The
+  `agreement_reviews` / `agreement_min` settings (see `plugin.yaml`) are the filter.
 - **First-class UI** — a **Verifier Mode** that rides on a real session: the
   sidebar's Verifier entry opens a regular session screen with the verifier
   attached, the titlebar shows "Verifier Mode" plus the verifier model
@@ -38,7 +46,7 @@ implementations:
 
 | Capability | Claude Code advisor | OMP advisor | Hermes Verifier |
 | --- | --- | --- | --- |
-| Advisor tools (verify claims, not prose) | — | `read`/`grep`/`glob` | **Yes** — `read_file`, `search_files` via a read-only allowlist |
+| Advisor tools (verify claims, not prose) | — | `read`/`grep`/`glob` | **Yes, opt-in** — `read_file`/`search_files` allowlist; measured near-inert (4 calls in 216 reviews) |
 | Per-session review budget | `max_uses` (per request) | — | **Yes** — `max_reviews_per_session` |
 | Advisory output cap | `max_tokens` | — | **Yes** — `advisor_max_tokens` |
 | Multi-advisor roster | — | `WATCHDOG.yml` | **Yes** — `VERIFIER.yml`, per-advisor model |
@@ -66,8 +74,12 @@ and not on a strong main model.
 With `advisor_tools: true`, an advisor whose roster entry (or `default_tools`)
 grants a tool may **verify a claim instead of reviewing prose** — reading the
 file the primary agent just edited, or grepping for the API it called. That is
-OMP's core advantage and the main reason an advisor beats a same-model
-rubber-stamp review.
+OMP's core advantage — but it is plumbing, not yet a working capability:
+
+> **Measured:** across 216 recorded reviews the reviewer made ~4 tool calls in
+> total. Treat tool use as opt-in plumbing, not a working capability — expect
+> the verifier to review prose first, with claim-checking reserved for the cases
+> where the transcript alone cannot settle a claim.
 
 The grant is deliberately narrow:
 
@@ -77,7 +89,11 @@ The grant is deliberately narrow:
 - Dispatch goes through `ctx.dispatch_tool`, so the host's approval, redaction,
   and result-budget pipelines still apply exactly as they would for a
   model-initiated call.
-- At most 3 tool calls per review, each result truncated to 6000 characters.
+- At most 3 tool calls per review. Each tool result is truncated to **1500**
+  characters (`delta._TOOL_RESULT_CAP` — one result row), and all tool evidence
+  forwarded in a single review is capped at **6000** characters total
+  (`runtime._MAX_EVIDENCE_CHARS`). Both are separate from `max_delta_chars`
+  (default **20000**), which caps the whole rendered delta sent for review.
 - Grants are **per verifier**: only an advisor that was granted a tool is told
   tools exist, and only it can call one.
 
@@ -94,21 +110,28 @@ capability is **off by default**, so the zero-config behavior is unchanged.
 | --- | --- | --- |
 | `enabled` | `false` | Run the verifier after every primary turn. |
 | `verifier_model` | `""` | Advisor model as `provider/model`; empty = the session's primary model. |
-| `advisor_tools` | `false` | Let granted advisors verify claims with read-only tools. |
+| `verifier_session` | `""` | Designated Verifier Mode session (managed by the desktop UI; do not edit by hand). |
+| `advisor_tools` | `false` | Let granted advisors verify claims with read-only tools. Only this switch enables the feature; a roster entry can only grant tools while it is on. |
 | `default_tools` | `[]` | Read-only tools for the default verifier. Non-allowlisted names are refused. |
 | `max_reviews_per_session` | `0` | Hard cap on reviews per session; `0` = unlimited. |
 | `advisor_max_tokens` | `0` | Cap advisor output per review; `0` = provider default, minimum `1024` when set. |
+| `advisor_routine_tokens` | `1024` | Output-token budget for a review the gate tiered `routine`; never applied below the `1024` floor. |
 | `nudge_first_turns` | `0` | Inject a consultation reminder into the first N turns. See the caveat above. |
-| `sync_backlog` | `"off"` | Catch-up pacing when the advisor falls behind: `off`/`1`/`3`/`5`. |
+| `sync_backlog` | `"off"` | Catch-up pacing when the advisor falls behind: any digit `1`–`5` (`off`/`0` disables). |
 | `immunity_turns` | `3` | Turns after an interrupting finding before another may interrupt. |
 | `max_delta_chars` | `20000` | Cap on the rendered transcript delta sent to the advisor. |
 | `blocker_steer` | `true` | Let a blocker keep a coding turn alive via the pre-verify gate. |
+| `gate_enabled` | `false` | A cheap model call decides whether each turn is reviewed at all, and at what effort. Fail-safe: any error or unparseable reply engages the review at deep effort. |
+| `phase_gate_enabled` | `false` | Review an impending high-risk tool call and veto it before it runs. Fails open: if the gate cannot reach its model, the call proceeds. |
+| `phase_max_per_turn` | `1` | Cap on phase-gate checks per turn. |
+| `agreement_reviews` | `1` | Run each review this many times; deliver a finding only when `agreement_min` of the runs raise it. Costs that many times the review price. |
+| `agreement_min` | `1` | How many of `agreement_reviews` must raise a finding for it to be delivered. Set equal for the strictest filter. |
 
 ## Repository layout (the repo root IS the installable package)
 
 ```
 hermes-verifier/               ← install root (~/.hermes/plugins/hermes-verifier/)
-├── plugin.yaml                ← manifest: 4 hooks, llm.model_override capability, schema
+├── plugin.yaml                ← manifest: 5 hooks, llm.model_override capability, schema
 ├── __init__.py                ← register(ctx)
 ├── brief.py                   ← VERIFIER.md / VERIFIER.yml discovery, @imports, prompts
 ├── advisor_tools.py           ← read-only tool grant: allowlist, TOOL_CALL protocol, dispatch
@@ -122,7 +145,7 @@ hermes-verifier/               ← install root (~/.hermes/plugins/hermes-verifi
 ├── desktop/
 │   └── plugin.js              ← Verifier Mode page (route /verifier)
 ├── skills/hermes-verifier/SKILL.md
-├── tests/                     ← 88 tests: guard, delta, runtime, roster, backlog,
+├── tests/                     ← 304 tests: guard, delta, runtime, roster, backlog,
 │                                budget, nudge, advisor tools, gaps, events
 ├── pytest.ini                 ← importlib mode: keeps pytest off the hyphenated root package
 ├── docs/design.md             ← full architecture and behavior spec
@@ -159,7 +182,7 @@ public. The probe detects both halves at the repo root: agent via
 
 - Session-scoped: `/verify on` (or the Verifier Mode page's switch).
 - Default-on: `plugins.entries.hermes-verifier.settings.enabled: true` in `config.yaml`.
-- Verifier model: `settings.model` as `provider/model`, or the dropdown in Verifier Mode.
+- Verifier model: `settings.verifier_model` as `provider/model`, or the dropdown in Verifier Mode.
 - Findings: `~/.hermes/plugin-data/hermes-verifier/verify.<session>.<verifier>.jsonl`.
 
 ## Status
@@ -170,12 +193,12 @@ after a gateway restart.
 
 ### Confirming the advisor is engaging
 
-`/verify status` reports an `engagement:` line with the review count and the
-empty-response count for this session. A non-zero review count means the advisor
-actually ran. `empty response(s)` counts provider completions that returned no
-payload — those are retried once, then surfaced in `last_error`. A rising empty
-count with a flat review count means the advisor model is not answering, not that
-it found nothing.
+`/verify status` reports an `engagement:` line, aggregated across every session the
+process has seen, with the review count and the empty-response count. A non-zero
+review count means the advisor actually ran. `empty response(s)` counts provider
+completions that returned no payload — those are retried once, then surfaced in
+`last_error`. A rising empty count with a flat review count means the advisor model
+is not answering, not that it found nothing.
 
 ## License
 

@@ -8,7 +8,8 @@ slice exists as early as possible.
 
 - [x] Repository skeleton: README, PLAN, design doc, license, folder layout
 - [x] Private GitHub repository
-- [ ] CI smoke job: YAML parse of `plugin.yaml` (no runtime yet)
+- [x] CI smoke job — shipped as `.github/workflows/ci.yml` (pytest, `plugins
+      validate`, `plugins doctor`, which parse `plugin.yaml`)
 
 ## M1 — Verifier runtime (agent-side)
 
@@ -80,9 +81,10 @@ Goal: a real session screen with the verifier attached.
 - [x] `VERIFIER.yml` roster: named verifiers with per-entry model / tools /
       instructions; specificity rule (project leaf > ancestor > user); each runs
       with its own guard, stats, model, and JSONL; findings deliver together
-- [ ] Verifier-side tool execution (roster `tools` grants are parsed, validated,
-      and surfaced; the plugin LLM surface has no tool loop — needs an
-      agent-loop design)
+- [x] Verifier-side tool execution — shipped in M5: a bounded `TOOL_CALL:`
+      line protocol over the plugin's LLM surface (`advisor_tools.py`), with
+      roster `tools` grants parsed, validated, and surfaced (the LLM surface's
+      native tool loop is not used)
 - [x] Catch-up window (`off | 1 | 3 | 5`) with a 30s cap and failure-release
 - [x] Interruption cooldown (`immunity_turns`)
 - [x] Usage/cost attribution surfaced in `/verify status` (aggregated per session)
