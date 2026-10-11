@@ -28,6 +28,27 @@ config_schema:
   verifier_model:
     type: str
     default: ""
+    # `choices` is what makes this a DROPDOWN. The host turns "type: str" plus a
+    # non-empty choices list into an enum field
+    # (hermes_cli/plugins_settings.py::_field_type), and the settings form renders
+    # an enum as a Select (apps/desktop/.../plugin-settings-form.tsx::EnumControl).
+    # Without it this was a free-text box, so the models the plugin is allowed to
+    # call were undiscoverable from the UI.
+    #
+    # Note the trade: the settings form validates an enum against this list, so a
+    # model NOT listed here cannot be saved FROM THE FORM. Editing config.yaml or
+    # the Verifier Mode titlebar picker (which reads the live catalog) still takes
+    # any model. Add entries here to widen the dropdown.
+    choices:
+    - nous/anthropic/claude-opus-5.5
+    - nous/anthropic/claude-sonnet-5
+    - openai-codex/gpt-6.1-sol
+    - openai-codex/gpt-6.1-sol-pro
+    - openai-codex/gpt-6-sol
+    - openai-codex/gpt-6-astra
+    - openai-codex/gpt-6-astra-pro
+    - deepseek/deepseek-flash
+    - deepseek/deepseek-v4-pro
     description: "Verifier model as 'provider/model' or a plain model id. Empty = the session's primary model. ('model' is a reserved settings root, hence the prefix.)"
   verifier_session:
     type: str
