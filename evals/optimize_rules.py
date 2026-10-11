@@ -21,12 +21,9 @@ enough that the reviewer is invoked at moments, not continuously.
 
 from __future__ import annotations
 
-import json
 import pathlib
-import re
 import sqlite3
-from collections import defaultdict
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Dict, List
 
 DB = pathlib.Path.home() / ".hermes" / "state.db"
 
@@ -37,7 +34,7 @@ import sys as _sys
 import pathlib as _pathlib
 _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[1]))
 from autoresearch.rules import (  # noqa: E402,F401
-    CANDIDATES, FAILURE, REPAIR, lift_on,
+    CANDIDATES, FAILURE, REPAIR,
 )
 
 
