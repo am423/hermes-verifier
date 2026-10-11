@@ -203,3 +203,9 @@ unaffected — they are labelled data, not derived from the label.
 `repair_next_any` keeps the old broad reading (prose + tool args + results) so a
 run can print both side by side.
 
+Follow-up (same day): excluding inactive (`active=0`) messages — compacted-away
+or rewound rows — narrows the corpus to 289 turns / 22 sessions and the new
+label to 23 positives (8.0%). The loop now reports "insufficient data" on this
+corpus (144–145 turns per half against the 150-turn floor), which is the honest
+verdict: it cannot decide anything yet.
+
