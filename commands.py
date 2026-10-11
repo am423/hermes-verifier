@@ -28,10 +28,13 @@ Subcommands:
   reset          Re-prime this session's verifier (clear dedupe + cursor).
   dump [raw]     Recent accepted findings. 'raw' includes private reasoning.
 
-Config (plugins.entries.hermes-verifier.settings):
+Config (plugins.entries.hermes-verifier.settings) -- the full 18-key schema is
+in plugin.yaml; the ones a user is most likely to want:
   enabled, verifier_model, sync_backlog, immunity_turns, max_delta_chars,
   blocker_steer, advisor_tools, default_tools, max_reviews_per_session,
-  advisor_max_tokens, nudge_first_turns
+  advisor_max_tokens, nudge_first_turns,
+  gate_enabled, phase_gate_enabled, phase_max_per_turn,
+  agreement_reviews, agreement_min, advisor_routine_tokens, verifier_session
 
 Model override requires plugins.entries.hermes-verifier.llm.allow_model_override:
 true (or the llm.model_override capability grant).

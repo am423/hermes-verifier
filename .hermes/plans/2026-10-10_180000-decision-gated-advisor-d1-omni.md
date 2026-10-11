@@ -1,3 +1,9 @@
+> **SUPERSEDED.** Kept for the record. The D1-omni / dynamic-tier direction
+> this describes was abandoned on measured evidence -- `d1-omni-600M` could not
+> separate a paraphrase from a distinct finding, and the semantic dedupe stage it
+> proposed is disabled and documented UNVALIDATED in `sidecar/NEGATIVE-RESULTS.md`.
+> The current work is in `2026-10-11_074500-closeout-v0.4.0.md`.
+
 # Plan — Decision-Gated Advisor with a Continuous Evaluation Loop
 
 ## Goal
