@@ -447,6 +447,11 @@ def _log_path(session_id: str, slug: str) -> Path:
     return data_dir() / f"verify.{_slug_session(session_id)}.{slug}.jsonl"
 
 
+def _decision_log_path(kind: str, session_id: str) -> Path:
+    """One append-only file per decision kind, mirroring gate.<session>.jsonl."""
+    return data_dir() / f"{kind}.{_slug_session(session_id)}.jsonl"
+
+
 def _gate_log_path(session_id: str) -> Path:
     return data_dir() / f"gate.{_slug_session(session_id)}.jsonl"
 
@@ -739,6 +744,16 @@ def _review_agreeing(state: SessionVerifier, verifier: Verifier, delta_text: str
     publish_event("review_agreement", {
         "session_id": state.session_id, "verifier": verifier.slug,
         "reviews": n, "required": k, "raised": len(raised), "agreed": agreed,
+    })
+    _append_jsonl(_decision_log_path("agreement", state.session_id), {
+        "ts": time.time(),
+        "session_id": state.session_id,
+        "origin_turn": origin_turn,
+        "reviews": n,
+        "required": k,
+        "raised": len(raised),
+        "agreed": agreed,
+        "severity": str((raised[0] if raised else {}).get("severity") or "none"),
     })
     if not agreed:
         logger.info(
@@ -1195,7 +1210,8 @@ def _action_is_high_risk(tool_name: str, args: Any) -> Optional[str]:
 
 
 def handle_pre_tool_call(tool_name: Any = "", args: Any = None,
-                         task_id: Any = "", **kwargs: Any) -> Optional[Dict[str, Any]]:
+                         task_id: Any = "", session_id: Any = "",
+                         **kwargs: Any) -> Optional[Dict[str, Any]]:
     """Review an impending high-risk action and veto it if it should not run.
 
     Returns ``{"action": "block", "message": ...}`` to stop the call, or None to
@@ -1204,7 +1220,11 @@ def handle_pre_tool_call(tool_name: Any = "", args: Any = None,
     """
     if not _config(_CTX, "phase_gate_enabled", False):
         return None
-    session_id = _session_from_task(task_id)
+    # The host passes session_id directly (verified in
+    # hermes_cli/plugins.py::_get_pre_tool_call_directive_details); task_id is the
+    # fallback for callers that only supply that.
+    key = str(session_id or "") or _session_from_task(task_id)
+    session_id = key
     if not session_id or not subsystem_enabled(session_id):
         return None
     label = _action_is_high_risk(str(tool_name), args)
@@ -1281,6 +1301,18 @@ def _pre_review_action(state: SessionVerifier, tool_name: str, args: Any,
     publish_event("phase_gate", {
         "session_id": state.session_id, "tool": tool_name, "risk": label,
         "verdict": verdict or "unknown",
+    })
+    # DURABLE. EVENT_LOG is a bounded in-memory ring lost on restart, so without
+    # this the autoresearch loop cannot ask how often the gate blocked or
+    # whether those blocks were right.
+    _append_jsonl(_decision_log_path("phase", state.session_id), {
+        "ts": time.time(),
+        "session_id": state.session_id,
+        "origin_turn": state.turns_seen,
+        "tool": tool_name,
+        "risk": label,
+        "verdict": verdict or "unknown",
+        "args_excerpt": payload[:400],
     })
     if verdict != "block":
         return None

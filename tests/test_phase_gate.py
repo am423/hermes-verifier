@@ -149,3 +149,36 @@ def test_a_disabled_session_is_not_gated(ctx, monkeypatch):  # noqa: F811
         assert ctx.llm.calls == [], "a disabled session was gated anyway"
     finally:
         runtime.set_session_override("s1", True)
+
+
+def test_prefers_the_host_supplied_session_id(ctx, monkeypatch):  # noqa: F811
+    """The host passes session_id directly; task_id is only a fallback.
+
+    Verified against hermes_cli/plugins.py::_get_pre_tool_call_directive_details,
+    which invokes the hook with session_id=... alongside task_id=...
+    """
+    ctx.config["phase_gate_enabled"] = True
+    runtime._get_state("s1")
+    ctx.llm.next = FakeResult({"verdict": "block", "finding": "nope"})
+    out = runtime.handle_pre_tool_call(tool_name="terminal",
+                                       args={"command": "rm -rf /x"},
+                                       session_id="s1", task_id="task-xyz")
+    assert out is not None and out["action"] == "block"
+
+
+def test_the_block_schema_matches_the_host_contract(ctx, monkeypatch):  # noqa: F811
+    """The host requires exactly {"action": "block", "message": <non-empty str>}.
+
+    hermes_cli/plugins.py drops a block directive with no message, so a missing
+    or empty message silently turns the veto into a no-op -- the tool runs and
+    the plugin believes it blocked.
+    """
+    ctx.config["phase_gate_enabled"] = True
+    runtime._get_state("s1")
+    ctx.llm.next = FakeResult({"verdict": "block", "finding": ""})
+    out = _call("terminal", {"command": "rm -rf /x"})
+    assert isinstance(out, dict)
+    assert out.get("action") == "block"
+    assert isinstance(out.get("message"), str) and out["message"].strip(), (
+        "a block with no message is dropped by the host and the call proceeds"
+    )
