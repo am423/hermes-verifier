@@ -176,3 +176,30 @@ This also means the gate's skips should be audited rather than assumed: every
 decision — skip included — is now persisted to `gate.<session>.jsonl` with the
 digest it was made on, because a skipped turn runs no verifier and otherwise
 leaves no trace of why.
+
+---
+
+## 6. The autoresearch label changed — every prior lift figure is obsolete
+
+The autoresearch outcome label (`repair_next`) was word-bounded and restricted to
+the next turn's assistant PROSE. It previously had no word boundaries and matched
+across prose + tool-call arguments + tool RESULTS, which made it a proxy for "the
+next turn ran tests": `regress` matched "regression" (a regression suite),
+`recover` matched git-log output, and only 87 of the 346 positives (25%, measured
+the same day) came from the agent's own words.
+
+Re-measured on the corpus of 2026-10-11 (863 turns, 25 sessions):
+
+```
+old label (unbounded, prose+args+results)   346 positives   40.1%
+word boundaries only (broad sources)        235 positives   27.2%
+prose only + boundaries (NEW)                87 positives   10.1%
+```
+
+**No lift, null or adoption figure produced before this change is comparable
+with anything produced after it.** The loop's decision logs themselves are
+unaffected — they are labelled data, not derived from the label.
+
+`repair_next_any` keeps the old broad reading (prose + tool args + results) so a
+run can print both side by side.
+

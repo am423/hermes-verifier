@@ -5,7 +5,9 @@ Two sources, one shape:
   * what the agent actually did (state.db messages), segmented into turns
 
 A "turn" starts at a user message and runs until the next one. The outcome label
-is computed from the FOLLOWING turn.
+(`repair_next`) is computed from the FOLLOWING turn's assistant PROSE only;
+`repair_next_any` keeps the older, broad reading (prose + tool args + tool
+results) so the two can be compared.
 """
 
 from __future__ import annotations
@@ -79,16 +81,22 @@ def load_turns(db: pathlib.Path) -> List[Dict[str, Any]]:
         if len(turns) < 6:
             continue
         for i, t in enumerate(turns):
-            nxt = ""
+            nxt_prose = ""
+            nxt_any = ""
             if i + 1 < len(turns):
-                nxt = (" ".join(turns[i + 1]["says"]) + "\n"
-                       + "\n".join(turns[i + 1]["calls"]))
+                nxt_prose = " ".join(turns[i + 1]["says"])
+                nxt_any = nxt_prose + "\n" + "\n".join(turns[i + 1]["calls"])
             out.append({
                 "session_id": sid, "turn": i,
                 "calls": "\n".join(t["calls"]), "says": "\n".join(t["says"]),
                 "edits": t["edits"],
-                "repair_next": bool(REPAIR.search(nxt)) if nxt else False,
-                "fail_next": bool(FAILURE.search(nxt)) if nxt else False,
+                # Prose only. Including tool args and results made the label a
+                # proxy for "the next turn ran tests or printed repo text".
+                "repair_next": bool(REPAIR.search(nxt_prose)) if nxt_prose else False,
+                # The old, broad reading (prose + tool args + tool results),
+                # kept so the two labels can be compared.
+                "repair_next_any": bool(REPAIR.search(nxt_any)) if nxt_any else False,
+                "fail_next": bool(FAILURE.search(nxt_any)) if nxt_any else False,
             })
     return out
 

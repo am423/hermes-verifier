@@ -35,22 +35,40 @@ _DEPLOY_WORDS = ["deploy", "production", "prod ", "release", "publish"]
 
 
 def rx(words: List[str]) -> "re.Pattern[str]":
-    return re.compile("|".join(re.escape(w) for w in words), re.I)
+    """Alternation with a word boundary on each side that needs one.
+
+    Boundaries matter: unbounded alternation made `regress` match "regression"
+    (1342 of 1352 matches were mid-word, i.e. a regression TEST suite) and
+    `recover` match git-log output, so the label largely measured "the next
+    turn ran tests". The boundary is applied per entry and only on a side
+    whose edge is a word character, so entries like "error:" or "> /etc/" --
+    which a naive ``\\b(?:...)\\b`` would silently stop matching -- keep
+    working.
+    """
+    parts = []
+    for raw in words:
+        word = (raw or "").strip()
+        if not word:
+            continue
+        left = r"(?<!\w)" if re.match(r"\w", word[0]) else ""
+        right = r"(?!\w)" if re.match(r"\w", word[-1]) else ""
+        parts.append(left + re.escape(word) + right)
+    if not parts:
+        return re.compile(r"(?!)")      # matches nothing, never everything
+    return re.compile("|".join(parts), re.I)
 
 
-REPAIR = re.compile(
-    "|".join(re.escape(w) for w in [
-        "revert", "undo", "rollback", "roll back", "restore from", "back out",
-        "broke", "broken", "regress", "that was wrong", "my mistake",
-        "i was wrong", "didn't work", "did not work", "re-do", "redo",
-        "recover", "accidentally deleted", "no longer works",
-    ]), re.I)
+REPAIR = rx([
+    "revert", "undo", "rollback", "roll back", "restore from", "back out",
+    "broke", "broken", "regress", "that was wrong", "my mistake",
+    "i was wrong", "didn't work", "did not work", "re-do", "redo",
+    "recover", "accidentally deleted", "no longer works",
+])
 
-FAILURE = re.compile(
-    "|".join(re.escape(w) for w in [
-        "traceback", "error:", "failed", "exception", "no such file",
-        "permission denied", "command not found",
-    ]), re.I)
+FAILURE = rx([
+    "traceback", "error:", "failed", "exception", "no such file",
+    "permission denied", "command not found",
+])
 
 # Candidate triggers. Each is a predictor we can score on its own.
 CANDIDATES: Dict[str, Callable[[str, str, int], bool]] = {

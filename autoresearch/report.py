@@ -12,9 +12,10 @@ from typing import Any, Dict
 MIN_POSITIVES = 100
 
 CAVEAT = (
-    "The outcome label is repair language in the FOLLOWING turn. It measures "
-    "that repair FOLLOWED, not that a review would have prevented it. Every "
-    "number here is correlational."
+    "The outcome label is repair language in the FOLLOWING turn's assistant "
+    "prose -- tool arguments and tool results are not read. It measures that "
+    "repair FOLLOWED, not that a review would have prevented it. Every number "
+    "here is correlational."
 )
 
 
