@@ -677,12 +677,89 @@ def _review_one(state: SessionVerifier, verifier: Verifier, delta_text: str,
             return
         state.reviews_used += 1
     with verifier.review_lock:
-        return _review_one_serial(state, verifier, delta_text,
-                                  effort=effort, origin_turn=origin_turn)
+        n = safe_int(_config(_CTX, "agreement_reviews", 1), 1)
+        k = safe_int(_config(_CTX, "agreement_min", 1), 1)
+        if n <= 1 or k <= 1 or k > n:
+            return _review_one_serial(state, verifier, delta_text,
+                                      effort=effort, origin_turn=origin_turn)
+        return _review_agreeing(state, verifier, delta_text,
+                                effort=effort, origin_turn=origin_turn, n=n, k=k)
+
+
+def _review_agreeing(state: SessionVerifier, verifier: Verifier, delta_text: str,
+                     *, effort: str, origin_turn: int, n: int, k: int) -> None:
+    """Run the review N times and deliver only on K-of-N agreement.
+
+    Measured on the plugin's own case set: at >=3/3 the deepseek x baseline
+    configuration went from 67% false alarms to 17% while keeping 72% of
+    findings -- the only operating point measured below the ~30% rate at which
+    Coverity's data says users stop reading a reviewer at all.
+
+    It works because that model's false alarms are NOISY: they vary run to run,
+    so a repeat kills them. A model whose false alarms are SYSTEMATIC is not
+    helped -- agreement cannot filter a consistent error. Hence a setting, not a
+    fixed policy: measure your own model before enabling it.
+    """
+    # Stats are accumulated per pass inside _review_one_serial, so diffing them
+    # across the whole run gives the true cost of agreement -- which is the
+    # honest number, because agreement is N times the price of a review.
+    before_in = verifier.stats["input_tokens"]
+    before_out = verifier.stats["output_tokens"]
+
+    verdicts: List[Optional[Dict[str, Any]]] = []
+    for i in range(n):
+        if i:
+            # Each pass must be an INDEPENDENT judgement. The guard's dedupe
+            # would otherwise match pass 1's finding and suppress the identical
+            # text here, which makes agreement unsatisfiable by construction --
+            # every repeat would answer "none" and nothing would ever ship.
+            verifier.guard.reset()
+        verdicts.append(_review_one_serial(
+            state, verifier, delta_text, effort=effort,
+            origin_turn=origin_turn, deliver=False))
+
+    raised = [v for v in verdicts
+              if v and str(v.get("severity") or "none").strip().lower() != "none"]
+    agreed = len(raised) >= k
+
+    publish_event("review_agreement", {
+        "session_id": state.session_id, "verifier": verifier.slug,
+        "reviews": n, "required": k, "raised": len(raised), "agreed": agreed,
+    })
+    if not agreed:
+        logger.info(
+            "verifier %s suppressed a %d/%d agreed finding for %s "
+            "(below the %d-of-%d bar)",
+            verifier.slug, len(raised), n, state.session_id, k, n)
+
+    # A single delivery decision, from the first raising pass: it is the one the
+    # guard validated and the one carrying full telemetry.
+    deliverable = raised[0] if agreed else (verdicts[0] if verdicts else None)
+    if deliverable is None:
+        return
+    severity = str(deliverable.get("severity") or "none").strip().lower()
+    finding_text = str(deliverable.get("finding") or "").strip()
+    # The confirmation passes each called guard.accept() on their way through, so
+    # the guard has already SEEN this finding. Accepting it again here would be
+    # deduped by the passes' own bookkeeping and the finding would never be
+    # delivered -- so the filter would suppress everything, unanimously or not.
+    # Clear that history first: this is the real delivery, and it deserves a
+    # clean guard with its full phrase filter, dedupe and rate limit intact.
+    verifier.guard.reset()
+    verifier.guard.begin_cycle()
+    accepted = bool(agreed and severity != "none" and finding_text
+                    and verifier.guard.accept(severity, finding_text))
+    usage = types.SimpleNamespace(
+        input_tokens=verifier.stats["input_tokens"] - before_in,
+        output_tokens=verifier.stats["output_tokens"] - before_out,
+        cost_usd=None)
+    _record_and_deliver(state, verifier, deliverable, accepted, usage,
+                        delta_excerpt=delta_text, origin_turn=origin_turn)
 
 
 def _review_one_serial(state: SessionVerifier, verifier: Verifier, delta_text: str,
-                       effort: str = "deep", origin_turn: int = 0) -> None:
+                       effort: str = "deep", origin_turn: int = 0,
+                       deliver: bool = True) -> Optional[Dict[str, Any]]:
     ctx = _CTX
     if ctx is None:
         return
@@ -912,19 +989,22 @@ def _review_one_serial(state: SessionVerifier, verifier: Verifier, delta_text: s
     if severity == "none" or not finding_text:
         # Still record: cost must be measurable for reviews that find nothing,
         # otherwise the majority of spend is invisible.
-        _record_and_deliver(state, verifier, parsed, False, usage,
-                            delta_excerpt=delta_text, prompt_parts=parts,
-                            origin_turn=origin_turn)
-        return
+        if deliver:
+            _record_and_deliver(state, verifier, parsed, False, usage,
+                                delta_excerpt=delta_text, prompt_parts=parts,
+                                origin_turn=origin_turn)
+        return parsed
     # Restatement suppression lives in guard.py as exact-text dedupe. A
     # semantic pass was built here and removed: measured against realistic
     # same-session negatives it could not separate a paraphrase from a distinct
     # finding (0.29-0.81 overlapping 0.59-0.78), so enabling it suppressed
     # genuine findings. See sidecar/NEGATIVE-RESULTS.md.
     accepted = verifier.guard.accept(severity, finding_text)
-    _record_and_deliver(state, verifier, parsed, accepted, usage,
-                        delta_excerpt=delta_text, prompt_parts=parts,
-                        origin_turn=origin_turn)
+    if deliver:
+        _record_and_deliver(state, verifier, parsed, accepted, usage,
+                            delta_excerpt=delta_text, prompt_parts=parts,
+                            origin_turn=origin_turn)
+    return parsed if accepted else None
 
 
 def _run_review(state: SessionVerifier, delta_text: str,

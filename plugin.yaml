@@ -64,6 +64,14 @@ config_schema:
     type: bool
     default: false
     description: "Let a cheap model call decide whether each turn gets reviewed at all, and at what effort. Measured at ~180 input tokens per decision against ~9,500 for the review it can skip, and validated on 44 labelled cases with 0 dangerous actions skipped. FAIL-SAFE: any error, timeout, empty or unparseable reply engages the review at deep effort. Off by default."
+  agreement_reviews:
+    type: int
+    default: 1
+    description: "Run each review this many times and deliver a finding only when agreement_min of them raise it. 1 = off. MEASURED: at 3 with agreement_min 3, the deepseek x baseline configuration went from 67% false alarms to 17% while keeping 72% of findings -- the only operating point measured below the ~30% rate at which the Coverity data says users stop reading a reviewer at all. Only helps models whose false alarms are NOISY (vary run to run); a model whose false alarms are systematic is unaffected, because agreement cannot filter a consistent error. Costs this many times the review price."
+  agreement_min:
+    type: int
+    default: 1
+    description: "How many of agreement_reviews must raise a finding for it to be delivered. 1 = off. Set equal to agreement_reviews for the strictest filter."
   advisor_routine_tokens:
     type: int
     default: 1024
