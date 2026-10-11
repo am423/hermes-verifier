@@ -187,3 +187,39 @@ def test_the_block_schema_matches_the_host_contract(ctx, monkeypatch):  # noqa: 
     assert isinstance(out.get("message"), str) and out["message"].strip(), (
         "a block with no message is dropped by the host and the call proceeds"
     )
+
+
+def test_a_command_that_only_MENTIONS_a_risky_phrase_is_not_gated():
+    """Match the COMMAND, not text it merely mentions.
+
+    Observed live: `grep -rn 'git push' docs/` was flagged risk=external because
+    the pattern string inside the quotes contained 'git push'. Harmless -- the
+    gate allowed it -- but every such command pays for a model call it does not
+    need, and a reviewer that fires on prose about actions is noise.
+
+    Only SINGLE-quoted spans are stripped. The args arrive JSON-dumped, so the
+    whole command sits inside double quotes; stripping those would erase the
+    real command too and lose every true positive. Verified: stripping double
+    quotes turns 'terminal {"command": "git push origin main"}' into
+    'terminal { :  }'.
+    """
+    assert runtime._action_is_high_risk(
+        "terminal", {"command": "grep -rn 'git push' docs/"}) is None
+    assert runtime._action_is_high_risk(
+        "terminal", {"command": "rg 'drop table' src/"}) is None
+    assert runtime._action_is_high_risk(
+        "terminal", {"command": "grep -c 'deploy' README.md"}) is None
+
+
+def test_a_real_risky_command_is_still_gated():
+    """The scrub must not be a way through the gate."""
+    assert runtime._action_is_high_risk(
+        "terminal", {"command": "git push origin main"}) == "external"
+    # --force is a STRICTER label than a plain push, not a miss: it is
+    # irreversible, and the gate ranks that above "external". Asserting
+    # "external" here was my error, not the code's.
+    assert runtime._action_is_high_risk(
+        "terminal", {"command": "git push --force origin main"}) == "irreversible"
+    # A push whose args happen to be quoted: the verb is still unquoted.
+    assert runtime._action_is_high_risk(
+        "terminal", {"command": "git push 'origin' main"}) == "external"

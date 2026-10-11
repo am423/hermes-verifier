@@ -1261,6 +1261,21 @@ def _action_is_high_risk(tool_name: str, args: Any) -> Optional[str]:
     except (TypeError, ValueError):
         blob = str(args)
     blob = f"{tool_name} {blob}"
+    # Match the COMMAND, not text the command merely MENTIONS. Observed live:
+    # `grep -rn 'git push' docs/` was flagged risk=external because the pattern
+    # string inside the quotes contained "git push". Harmless -- the gate
+    # allowed it -- but every such command paid for a model call it did not
+    # need, and a gate that fires on prose ABOUT actions is noise.
+    #
+    # SINGLE quotes only. The args arrive JSON-dumped, so the whole command sits
+    # inside double quotes: stripping those erases the real command too and
+    # would lose every true positive (measured: 'terminal {"command": "git push
+    # origin main"}' becomes 'terminal { :  }'). A real push keeps its verb
+    # unquoted, so true positives are unaffected -- pinned by a test.
+    try:
+        blob = re.sub(r"'[^']*'", " ", blob)
+    except re.error:
+        pass
     for label, pattern in _phase_patterns():
         if pattern.search(blob):
             return label
