@@ -727,20 +727,48 @@ def _review_agreeing(state: SessionVerifier, verifier: Verifier, delta_text: str
     before_out = verifier.stats["output_tokens"]
 
     verdicts: List[Optional[Dict[str, Any]]] = []
-    for i in range(n):
-        if i:
+    _shared_guard = verifier.guard
+    try:
+        for _i in range(n):
             # Each pass must be an INDEPENDENT judgement. The guard's dedupe
             # would otherwise match pass 1's finding and suppress the identical
             # text here, which makes agreement unsatisfiable by construction --
             # every repeat would answer "none" and nothing would ever ship.
-            verifier.guard.reset()
-        verdicts.append(_review_one_serial(
-            state, verifier, delta_text, effort=effort,
-            origin_turn=origin_turn, deliver=False))
+            #
+            # Independence comes from a SCRATCH guard, not from resetting the
+            # shared one. reset() cleared the dedupe history for the whole
+            # SESSION, so after any agreement review the guard had forgotten
+            # every finding it had ever delivered and an earlier turn's finding
+            # could ship again. A scratch guard also keeps these probe passes out
+            # of the shared counters, so one delivered finding is one accept.
+            verifier.guard = guard_mod.EmissionGuard()
+            verdicts.append(_review_one_serial(
+                state, verifier, delta_text, effort=effort,
+                origin_turn=origin_turn, deliver=False))
+    finally:
+        verifier.guard = _shared_guard
 
-    raised = [v for v in verdicts
-              if v and str(v.get("severity") or "none").strip().lower() != "none"]
-    agreed = len(raised) >= k
+    # Cluster the passes by NORMALIZED finding text and require K votes for ONE
+    # cluster. Counting "did it raise anything" let a single-pass caution win
+    # while a majority-endorsed blocker was discarded with no record -- which
+    # inverts the precision trade the filter exists for.
+    clusters: Dict[str, List[Dict[str, Any]]] = {}
+    for _v in verdicts:
+        if not _v:
+            continue
+        if str(_v.get("severity") or "none").strip().lower() == "none":
+            continue
+        _key = guard_mod.normalize(str(_v.get("finding") or "")) or str(_v.get("finding") or "")
+        clusters.setdefault(_key, []).append(_v)
+
+    _rank = {"note": 1, "caution": 2, "blocker": 3}
+    winning: List[Dict[str, Any]] = []
+    for _members in sorted(clusters.values(), key=len, reverse=True):
+        if len(_members) >= k:
+            winning = _members
+            break
+    raised = [m for _members in clusters.values() for m in _members]
+    agreed = bool(winning)
 
     publish_event("review_agreement", {
         "session_id": state.session_id, "verifier": verifier.slug,
@@ -754,7 +782,16 @@ def _review_agreeing(state: SessionVerifier, verifier: Verifier, delta_text: str
         "required": k,
         "raised": len(raised),
         "agreed": agreed,
-        "severity": str((raised[0] if raised else {}).get("severity") or "none"),
+        "verifier": verifier.slug,
+        "severity": str((winning[0] if winning else (raised[0] if raised else {})).get("severity") or "none"),
+        # The split, so a finding the bar dropped is auditable rather than
+        # invisible: one entry per distinct finding the passes raised.
+        "clusters": [
+            {"votes": len(_m),
+             "severity": str(_m[0].get("severity") or "none"),
+             "text": str(_m[0].get("finding") or "")[:160]}
+            for _m in sorted(clusters.values(), key=len, reverse=True)
+        ],
     })
     if not agreed:
         logger.info(
@@ -764,18 +801,21 @@ def _review_agreeing(state: SessionVerifier, verifier: Verifier, delta_text: str
 
     # A single delivery decision, from the first raising pass: it is the one the
     # guard validated and the one carrying full telemetry.
-    deliverable = raised[0] if agreed else (verdicts[0] if verdicts else None)
+    deliverable = (max(winning, key=lambda m: _rank.get(
+        str(m.get("severity") or "note").strip().lower(), 0)) if winning
+        else (verdicts[0] if verdicts else None))
     if deliverable is None:
         return
     severity = str(deliverable.get("severity") or "none").strip().lower()
     finding_text = str(deliverable.get("finding") or "").strip()
-    # The confirmation passes each called guard.accept() on their way through, so
-    # the guard has already SEEN this finding. Accepting it again here would be
-    # deduped by the passes' own bookkeeping and the finding would never be
-    # delivered -- so the filter would suppress everything, unanimously or not.
-    # Clear that history first: this is the real delivery, and it deserves a
-    # clean guard with its full phrase filter, dedupe and rate limit intact.
-    verifier.guard.reset()
+    # The probe passes ran against scratch guards, so the shared guard never saw
+    # this finding and its session history is intact. That makes this accept a
+    # real session-wide decision: it applies the phrase filter, the dedupe
+    # against everything delivered in this session, and the per-cycle limit.
+    #
+    # This used to reset() first, to stop the passes' own bookkeeping from
+    # deduping the delivery. The reset cleared the WHOLE session's history --
+    # fixing a per-review problem by destroying session state.
     verifier.guard.begin_cycle()
     accepted = bool(agreed and severity != "none" and finding_text
                     and verifier.guard.accept(severity, finding_text))

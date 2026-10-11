@@ -132,3 +132,88 @@ def test_agreement_cost_is_accounted(ctx, monkeypatch):  # noqa: F811
     assert verifier.stats["reviews"] >= before + 3, (
         "three passes ran but fewer than three were counted"
     )
+
+
+def test_agreement_leaves_the_session_dedupe_intact(ctx, monkeypatch):  # noqa: F811
+    """A delivered finding must still be IN the guard's history afterwards.
+
+    The filter called guard.reset() on the SHARED guard -- once between passes
+    and again before every delivery -- which clears dedupe for the whole
+    SESSION, not just the passes' own bookkeeping. After any agreement review
+    the guard had forgotten everything it had ever delivered, so the same
+    finding was free to come back on a later turn.
+
+    Asserts on the public accept() rather than on a delivered-again outcome: a
+    repeat CAN also be suppressed by failing to clear the vote bar, which would
+    make the test pass while the history was still being wiped.
+    """
+    ctx.config["agreement_reviews"] = 3
+    ctx.config["agreement_min"] = 3
+    state, verifier = _state()
+
+    first = {"severity": "caution", "finding": "the write path bypasses the queue"}
+    second = {"severity": "caution", "finding": "the retry loop is untested"}
+
+    # Turn 1 delivers `first`. Everything in _seen now is {first}.
+    _arm(ctx, [first, first, first])
+    runtime._review_one(state, verifier, "delta one", "deep", 1)
+    assert verifier.pending, "precondition: the first finding was delivered"
+    verifier.pending.clear()
+
+    # Turn 2 delivers a DIFFERENT finding. Under the bug this reset()s the shared
+    # guard on the way through, which is what forgets `first`.
+    _arm(ctx, [second, second, second])
+    runtime._review_one(state, verifier, "delta two", "deep", 2)
+    assert verifier.pending, "precondition: the second finding was delivered"
+
+    # begin_cycle() before each probe: accept() checks dedupe and THEN a
+    # one-finding-per-cycle budget, so without this both probes return False
+    # from the rate limit and the assertion would pass while the history was
+    # still being wiped. Opening the cycle makes the result mean "already seen".
+    verifier.guard.begin_cycle()
+    assert verifier.guard.accept("caution", first["finding"]) is False, (
+        "the guard forgot an EARLIER delivered finding: the second agreement "
+        "review reset the session history, so turn 1's finding can ship again"
+    )
+    verifier.guard.begin_cycle()
+    assert verifier.guard.accept("caution", second["finding"]) is False, (
+        "the guard forgot the finding it had just delivered"
+    )
+
+
+def test_the_passes_do_not_pollute_the_shared_guard(ctx, monkeypatch):  # noqa: F811
+    """Independence must come from scratch guards, not from amnesia.
+
+    The old design reset the shared guard so pass 2 would not see pass 1's
+    finding. A scratch guard per pass gives the same independence while leaving
+    the shared guard's history and counters alone -- which is what makes the
+    accept count meaningful and dedupe survive.
+    """
+    ctx.config["agreement_reviews"] = 3
+    ctx.config["agreement_min"] = 3
+    state, verifier = _state()
+    before = dict(verifier.guard.stats)
+
+    _arm(ctx, [ENVELOPE, ENVELOPE, ENVELOPE])
+    runtime._review_one(state, verifier, "delta", "deep", 1)
+
+    assert verifier.guard.stats["accepted"] == before["accepted"] + 1, (
+        "three probe passes plus one delivery recorded "
+        f"{verifier.guard.stats['accepted'] - before['accepted']} accepts, not 1"
+    )
+
+
+def test_agreement_rows_name_the_verifier(ctx, monkeypatch):  # noqa: F811
+    """With a roster, agreement rows were indistinguishable from each other."""
+    import json
+    ctx.config["agreement_reviews"] = 2
+    ctx.config["agreement_min"] = 2
+    state, verifier = _state()
+    _arm(ctx, [ENVELOPE, ENVELOPE])
+    runtime._review_one(state, verifier, "delta", "deep", 1)
+    path = runtime.data_dir() / f"agreement.{runtime._slug_session('s1')}.jsonl"
+    rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    assert rows[-1].get("verifier") == "default", (
+        "agreement rows carry no verifier: with a roster you cannot tell which "
+        "entry produced a suppression"
+    )
