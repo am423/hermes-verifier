@@ -1,5 +1,5 @@
 name: hermes-verifier
-version: 0.3.0
+version: 0.4.0
 description: >-
   Attach an independent verifier model to your Hermes session: it reviews each
   primary-agent turn delta, verifies claims with read-only tools, raises findings
