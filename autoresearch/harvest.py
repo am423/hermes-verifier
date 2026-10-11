@@ -56,14 +56,19 @@ def load_turns(db: pathlib.Path) -> List[Dict[str, Any]]:
         return []
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
+    # active=0 rows were compacted away or rewound by the user; the host's own
+    # reader hides them, and the analysis must too. Older DBs have no such
+    # column, so guard before filtering rather than breaking the loop.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(messages)")}
+    active = " and active=1" if "active" in cols else ""
     sessions = [r["session_id"] for r in con.execute(
-        "select session_id from messages where role in ('assistant','tool') "
-        "group by session_id having count(*) >= 20")]
+        "select session_id from messages where role in ('assistant','tool')"
+        + active + " group by session_id having count(*) >= 20")]
     out: List[Dict[str, Any]] = []
     for sid in sessions:
         rows = list(con.execute(
             "select role, content, tool_calls from messages "
-            "where session_id=? order by id", (sid,)))
+            "where session_id=?" + active + " order by id", (sid,)))
         turns: List[Dict[str, Any]] = []
         cur: Dict[str, Any] = None  # type: ignore[assignment]
         for r in rows:

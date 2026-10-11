@@ -72,3 +72,32 @@ def test_the_label_reads_the_next_turns_prose_only(tmp_path):
     assert sixth["repair_next_any"] is True, (
         "the broad comparison label must keep the old, tools-included reading"
     )
+
+
+def test_inactive_messages_are_excluded(tmp_path):
+    """61% of rows in the segmented sessions are active=0: compacted away, or
+    rewound by the user. The host's own reader hides them; the analysis scored
+    them.
+
+    The plan's sketch (user + 2 assistant rows per turn) leaves the session
+    below the >= 20 assistant/tool rows a session needs to be segmented at
+    all, so each turn here carries 4 kept assistant rows plus one compacted
+    row that must never surface."""
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute("create table messages (id integer primary key, session_id text,"
+                " role text, content text, tool_calls text, tool_name text,"
+                " active integer)")
+    for _ in range(8):
+        con.execute("insert into messages (session_id, role, content, active)"
+                    " values ('s1','user','do a thing',1)")
+        for _ in range(4):
+            con.execute("insert into messages (session_id, role, content, active)"
+                        " values ('s1','assistant','kept',1)")
+        con.execute("insert into messages (session_id, role, content, active)"
+                    " values ('s1','assistant','COMPACTED-AWAY',0)")
+    con.commit()
+    con.close()
+    rows = harvest(tmp_path, db)
+    assert rows
+    assert "COMPACTED-AWAY" not in " ".join(r["says"] for r in rows)
