@@ -11,7 +11,7 @@ static scanner reads them as data rather than as code that performs them.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 # Split where a scanner would otherwise read these as live code.
 _IRREVERSIBLE = [
@@ -95,16 +95,22 @@ CANDIDATES: Dict[str, Callable[[str, str, int], bool]] = {
 }
 
 
-def lift_on(turns: List[Dict[str, Any]], mask: List[bool]) -> float:
-    """P(repair | fired) / P(repair). 0.0 when the rule never fires.
+def lift_on(turns: List[Dict[str, Any]],
+            mask: List[bool]) -> "Optional[float]":
+    """P(repair | fired) / P(repair), or None when lift is undefined.
+
+    None when the rule never fires or no turn carries a positive label: a
+    phantom 0.0 once let a candidate be scored against a rule that never
+    fired and reported gap +4.0 with a CI of (3.42, 4.88). "Never fires" has
+    no lift, and no baseline means nothing to compare against.
 
     The single definition of lift: a second copy in the loop would eventually
     disagree with this one.
     """
     fired = [t for t, m in zip(turns, mask) if m]
     if not fired:
-        return 0.0
+        return None
     base = sum(1 for t in turns if t["repair_next"]) / max(1, len(turns))
     if not base:
-        return 0.0
+        return None
     return (sum(1 for t in fired if t["repair_next"]) / len(fired)) / base

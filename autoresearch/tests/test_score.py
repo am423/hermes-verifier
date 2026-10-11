@@ -44,3 +44,16 @@ def test_the_multiplicity_bar_widens_with_the_number_of_candidates():
     assert many["multiplicity"]["alpha_each"] < one["multiplicity"]["alpha_each"], (
         "more candidates must mean a stricter bar, or the pass manufactures winners"
     )
+
+
+def test_an_undefined_baseline_is_unscorable():
+    """lift_on returned 0.0 for a rule that never fires, so a candidate was
+    scored against a phantom zero and reported gap +4.0 with a CI of
+    (3.42, 4.88). "Never fires" has no lift; it must not be a scoreable
+    baseline."""
+    turns = _turns(20, 20)
+    res = compare_rules(turns, {"always": lambda t: False,
+                                "never": lambda t: True},
+                        reference="always", bootstraps=100, seed=1)
+    assert res["results"]["never"]["clears_bar"] is False
+    assert res["results"]["never"].get("unscorable") is True
