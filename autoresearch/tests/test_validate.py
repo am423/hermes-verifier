@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 from autoresearch.validate import split_by_session, validate
 
 
@@ -77,3 +79,40 @@ def test_thin_halves_are_insufficient_data_not_a_null():
     assert out["verdict"] == "insufficient data"
     assert out["survivors"] == []
     assert out["reason"], "the refusal must say what is missing"
+
+
+def _session_rate_corpus(seed=159, n_sessions=24, turns_per=30):
+    """Each session draws its own label rate and the rule fires on whole
+    sessions: the session-correlated shape that makes a bare sign test on
+    val_gap unreliable."""
+    rng = random.Random(seed)
+    rates = [rng.choice([0.15, 0.5, 0.85]) for _ in range(n_sessions)]
+    fire = set(rng.sample(range(n_sessions), rng.choice([9, 10, 11])))
+    turns = []
+    for s in range(n_sessions):
+        for i in range(turns_per):
+            turns.append({
+                "session_id": f"s{s}", "turn": i + 1, "calls": "ls", "says": "",
+                "edits": 1, "repair_next": rng.random() < rates[s],
+                "fire": s in fire,
+            })
+    return turns
+
+
+def test_confirmation_requires_the_cluster_interval():
+    """The demonstrated case (seed=159): on the held-out half val_gap is
+    +0.132 and even the turn-level interval excludes zero (low +0.041) -- the
+    bare `val_gap > 0` sign test confirmed and adopted it -- but the
+    session-cluster interval spans zero (low -0.145). Confirmation must follow
+    the cluster interval, and here the rejection is the interval's alone: the
+    rule fires in 5 validation sessions, so the coverage floor is met."""
+    out = validate(_session_rate_corpus(), {"always": lambda t: True,
+                                            "cand": lambda t: t["fire"]},
+                   reference="always", bootstraps=500, seed=1)
+    assert out["survivors"] == ["cand"]
+    h = out["held_out"]["cand"]
+    assert h["val_gap"] > 0
+    assert h["val_ci"][0] > 0, h["val_ci"]
+    assert h["val_cluster_ci"][0] < 0, h["val_cluster_ci"]
+    assert h["confirmed"] is False
+    assert out["adoptable"] == []

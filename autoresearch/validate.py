@@ -100,13 +100,25 @@ def validate(turns: List[Dict[str, Any]], candidates: Dict[str, Callable], *,
                                 bootstraps=bootstraps, seed=seed)
         for k in survivors:
             vr = val_res["results"][k]
+            # Confirmation is the CLUSTER interval excluding zero, on the
+            # held-out half, with the coverage floor applied there too -- a
+            # bare val_gap > 0 is a sign test that cannot see session noise,
+            # and on the demonstrated corpus it confirmed a candidate whose
+            # cluster interval still spanned zero.
+            confirmed = bool(
+                vr["cluster_ci"][0] is not None and vr["cluster_ci"][0] > 0
+                and not vr.get("unscorable")
+                and "ineligible" not in vr
+            )
             held_out[k] = {
                 "fit_gap": fit_res["results"][k]["gap"],
                 "val_gap": vr["gap"],
                 "val_ci": vr["ci"],
                 "val_cluster_ci": vr["cluster_ci"],
-                "confirmed": bool(vr["gap"] is not None and vr["gap"] > 0),
+                "confirmed": confirmed,
             }
+            if not confirmed and "ineligible" in vr:
+                held_out[k]["val_ineligible"] = vr["ineligible"]
 
     adoptable = [k for k, h in held_out.items() if h["confirmed"]]
     if not survivors:
