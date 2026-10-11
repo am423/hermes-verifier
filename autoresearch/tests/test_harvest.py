@@ -67,7 +67,7 @@ def test_the_label_reads_the_next_turns_prose_only(tmp_path):
     con.commit()
     con.close()
     rows = harvest(tmp_path, db)
-    sixth = next(r for r in rows if r["turn"] == 5)
+    sixth = next(r for r in rows if r["turn"] == 6)   # 1-based, as origin_turn is
     assert sixth["repair_next"] is False, "tool output leaked into the label"
     assert sixth["repair_next_any"] is True, (
         "the broad comparison label must keep the old, tools-included reading"
@@ -101,3 +101,35 @@ def test_inactive_messages_are_excluded(tmp_path):
     rows = harvest(tmp_path, db)
     assert rows
     assert "COMPACTED-AWAY" not in " ".join(r["says"] for r in rows)
+
+
+def test_decisions_land_on_their_own_turn(tmp_path):
+    """Every decision in a session was copied onto every turn (118 turns each
+    carrying the same 39 rows) because origin_turn was ignored.
+
+    Turns are numbered 1-based to match the plugin's own origin_turn counter.
+    The plan's 4-turn sketch sits below the >= 6 turns a session needs, so
+    this uses 7."""
+    d = tmp_path / "data"
+    d.mkdir()
+    (d / "gate.s1.jsonl").write_text("\n".join(
+        json.dumps({"origin_turn": t, "engage": True}) for t in (1, 2)))
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute("create table messages (id integer primary key, session_id text,"
+                " role text, content text, tool_calls text, tool_name text)")
+    for _ in range(7):
+        con.execute("insert into messages (session_id, role, content) values"
+                    " ('s1','user','turn')")
+        for _ in range(8):
+            con.execute("insert into messages (session_id, role, content) values"
+                        " ('s1','assistant','x')")
+    con.commit()
+    con.close()
+    rows = harvest(d, db)
+    counts = [len(r["decisions"]) for r in rows]
+    assert sum(counts) == 2, f"decisions were duplicated across turns: {counts}"
+    assert [c for c in counts if c] == [1, 1], (
+        f"decisions landed on the wrong turns: {counts}"
+    )
+    assert rows[0]["turn"] == 1, "turn numbering must match origin_turn (1-based)"

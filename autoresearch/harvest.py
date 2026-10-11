@@ -29,10 +29,15 @@ def read_decisions(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
     A torn final line (the process died mid-append) is skipped rather than
     raising: these files are appended to by a daemon thread, and the loop must
     not fall over on the last row.
+
+    Rows the plugin wrote carry their own session_id; when one is missing
+    (hand-written fixtures, older rows) the filename is the fallback --
+    `gate.<session>.jsonl` names the session the row belongs to.
     """
     out: List[Dict[str, Any]] = []
     for kind in ("gate", "phase", "agreement"):
         for path in sorted(data_dir.glob(f"{kind}.*.jsonl")):
+            file_session = path.stem.partition(".")[2]
             try:
                 text = path.read_text(errors="replace")
             except OSError:
@@ -46,6 +51,8 @@ def read_decisions(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
                     continue
                 if isinstance(row, dict):
                     row["kind"] = kind
+                    if not row.get("session_id"):
+                        row["session_id"] = file_session
                     out.append(row)
     return out
 
@@ -92,7 +99,9 @@ def load_turns(db: pathlib.Path) -> List[Dict[str, Any]]:
                 nxt_prose = " ".join(turns[i + 1]["says"])
                 nxt_any = nxt_prose + "\n" + "\n".join(turns[i + 1]["calls"])
             out.append({
-                "session_id": sid, "turn": i,
+                # 1-based, so it is directly comparable to a decision row's
+                # own `origin_turn`.
+                "session_id": sid, "turn": i + 1,
                 "calls": "\n".join(t["calls"]), "says": "\n".join(t["says"]),
                 "edits": t["edits"],
                 # Prose only. Including tool args and results made the label a
@@ -108,12 +117,23 @@ def load_turns(db: pathlib.Path) -> List[Dict[str, Any]]:
 
 def harvest(data_dir: pathlib.Path = DEFAULT_DATA,
             db: pathlib.Path = DEFAULT_DB) -> List[Dict[str, Any]]:
-    """Turns, with any decisions that belong to the same session attached."""
+    """Turns, with the decisions made ON each turn attached.
+
+    Attaching every decision of a session to every turn of that session (what
+    this used to do) copied the same rows onto all 118 turns of a session and
+    made any join meaningless.
+    """
     turns = load_turns(db)
     decisions = read_decisions(data_dir)
-    by_session: Dict[str, List[Dict[str, Any]]] = {}
+    by_turn: Dict[tuple, List[Dict[str, Any]]] = {}
     for d in decisions:
-        by_session.setdefault(str(d.get("session_id") or ""), []).append(d)
+        try:
+            origin = int(d.get("origin_turn") or 0)
+        except (TypeError, ValueError):
+            origin = 0
+        if origin < 1:
+            continue        # no turn attribution; the raw logs keep it
+        by_turn.setdefault((str(d.get("session_id") or ""), origin), []).append(d)
     for t in turns:
-        t["decisions"] = by_session.get(t["session_id"], [])
+        t["decisions"] = by_turn.get((t["session_id"], t["turn"]), [])
     return turns
