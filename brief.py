@@ -142,8 +142,41 @@ _FENCE = re.compile(r"^```|^~~~")
 _MAX_IMPORT_BYTES = 256 * 1024
 
 
+def _within(path: Path, root: Path) -> bool:
+    """True when ``path`` is ``root`` or inside it, after symlink resolution.
+
+    Compares RESOLVED paths, so a symlink pointing out of the tree is refused
+    even though its own name reads as contained.
+    """
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _import_root(entry: Optional[Path], base_dir: Path) -> Path:
+    """The directory an ``@import`` may not escape.
+
+    The importing file's repo root when it sits in one, else its own directory --
+    which is HERMES_HOME for the user-level VERIFIER.md. Without a bound a cloned
+    repo's VERIFIER.md could ``@path`` to ``~/.ssh/id_rsa`` (or any absolute or
+    ``..`` path) and the content went to the verifier's provider.
+    """
+    try:
+        anchor = Path(entry).resolve().parent if entry else Path(base_dir).resolve()
+    except OSError:
+        anchor = Path(base_dir)
+    try:
+        repo = _find_repo_root(anchor)
+    except Exception:
+        repo = None
+    return repo or anchor
+
+
 def expand_imports(text: str, base_dir: Path, seen: Optional[set] = None,
-                   depth: int = 0, entry: Optional[Path] = None) -> str:
+                   depth: int = 0, entry: Optional[Path] = None,
+                   root: Optional[Path] = None) -> str:
     """Expand ``@path`` import lines, mirroring context-file import rules.
 
     Relative imports resolve from the importing file's directory, ``~/`` from
@@ -154,6 +187,11 @@ def expand_imports(text: str, base_dir: Path, seen: Optional[set] = None,
     if depth > 8:
         return text
     seen = seen if seen is not None else set()
+    # Derive the bound ONCE and thread it. Each recursive call rebases base_dir
+    # on the file it expands, so recomputing per level would let a chain walk
+    # out: A imports sub/B, B imports ../../outside.
+    if root is None:
+        root = _import_root(entry, base_dir)
     if entry is not None:
         # Seed with the file being expanded, INSIDE the function, so "cycles are
         # skipped" holds however a caller invokes it. Seeding only at the call
@@ -204,13 +242,31 @@ def expand_imports(text: str, base_dir: Path, seen: Optional[set] = None,
                            raw, stat.st_size, _MAX_IMPORT_BYTES)
             out.append(line)
             continue
+        # Confine to the importing file's root BEFORE reading. `target` is already
+        # resolved, so a symlink whose own name looks contained is caught here.
+        if not _within(target, root):
+            logger.warning("@import %s resolves outside %s; left literal", raw, root)
+            out.append(line)
+            continue
+        # And defer to the host's own read policy when it exists, so a path this
+        # plugin would allow but Hermes would refuse is refused here too.
+        try:
+            from agent.file_safety import get_read_block_error
+            blocked = get_read_block_error(str(target))
+        except Exception:
+            blocked = None
+        if blocked:
+            logger.warning("@import %s refused by file safety: %s", raw, blocked)
+            out.append(line)
+            continue
         try:
             imported = target.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             out.append(line)  # missing import stays literal
             continue
         seen.add(target)
-        out.append(expand_imports(imported, target.parent, seen, depth + 1))
+        out.append(expand_imports(imported, target.parent, seen, depth + 1,
+                                  root=root))
     return "\n".join(out)
 
 

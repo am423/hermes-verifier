@@ -353,6 +353,30 @@ async def set_model(body: dict) -> JSONResponse:
     return JSONResponse(status_code=503, content={"ok": False, "error": "verifier backend not loaded"})
 
 
+def _ws_upgrade_authorized(ws: Any) -> bool:
+    """Authorize a WS upgrade via the dashboard's canonical gate.
+
+    `web_server_chat._ws_auth_ok` understands `?token=` / `?ticket=` /
+    `?internal=`; going through it means this endpoint cannot drift from core
+    auth. Accepts when the dashboard isn't importable, which is the same choice
+    the bundled kanban plugin makes so a bare-FastAPI test harness still works.
+
+    Required by NousResearch/hermes-agent#135996: the socket used to be accepted
+    with no check at all, so any local process could read the verifier's event
+    stream. Desktop's `ctx.socket` already sends `?token=`, so the page keeps
+    working.
+    """
+    try:
+        from hermes_cli import web_server_chat as _ws
+    except Exception:
+        return True
+    try:
+        return bool(_ws._ws_auth_ok(ws))
+    except Exception:
+        # A gate that raises must not become an open door.
+        return False
+
+
 @router.websocket("/events")
 async def events_ws(websocket: WebSocket) -> None:
     """Push verifier events to the UI; client disconnect ends the loop.
@@ -360,6 +384,9 @@ async def events_ws(websocket: WebSocket) -> None:
     The receive side is timeout-bounded so event flushing never waits on the
     client. Sends raise on disconnect, which terminates the loop.
     """
+    if not _ws_upgrade_authorized(websocket):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     client_seq = 0
     try:
