@@ -116,3 +116,20 @@ def test_confirmation_requires_the_cluster_interval():
     assert h["val_cluster_ci"][0] < 0, h["val_cluster_ci"]
     assert h["confirmed"] is False
     assert out["adoptable"] == []
+
+
+def test_degenerate_input_cannot_produce_a_confident_null():
+    """0 turns and 1 session used to yield a confident null -- the bootstrap
+    had nothing to resample and the verdict read as evidence."""
+    one_session = [{"session_id": "s0", "turn": i + 1, "calls": "ls", "says": "",
+                    "edits": 1, "repair_next": bool(i % 2), "fail_next": False}
+                   for i in range(40)]
+    for turns in ([], one_session):
+        out = validate(turns, {"always": lambda t: True,
+                               "never": lambda t: False},
+                       reference="always", bootstraps=50, seed=1)
+        assert out["verdict"] == "insufficient data", (
+            f"degenerate input produced {out['verdict']!r}"
+        )
+        assert out["survivors"] == [] and out["adoptable"] == []
+        assert out["reason"], "the refusal must say what is missing"

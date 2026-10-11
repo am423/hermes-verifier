@@ -145,3 +145,11 @@ def test_a_rule_firing_widely_is_not_ineligible():
                                 "cand": lambda t: t["fire"]},
                         reference="ref", bootstraps=200, seed=1)
     assert "ineligible" not in res["results"]["cand"]
+
+
+def test_no_turns_is_unscorable_not_a_crash():
+    """Empty input must produce a refusal, not a traceback and not a score."""
+    res = compare_rules([], {"a": lambda t: True, "b": lambda t: False},
+                        reference="a", bootstraps=10, seed=1)
+    assert res["results"]["b"]["clears_bar"] is False
+    assert res["results"]["b"]["unscorable"] is True
