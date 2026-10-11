@@ -85,7 +85,7 @@ Goal: a real session screen with the verifier attached.
       line protocol over the plugin's LLM surface (`advisor_tools.py`), with
       roster `tools` grants parsed, validated, and surfaced (the LLM surface's
       native tool loop is not used)
-- [x] Catch-up window (`off | 1 | 3 | 5`) with a 30s cap and failure-release
+- [x] Catch-up window (`off`/`0` disables, any digit `1`–`5` accepted) with a 30s cap and failure-release
 - [x] Interruption cooldown (`immunity_turns`)
 - [x] Usage/cost attribution surfaced in `/verify status` (aggregated per session)
 - [x] Bundled skill (`skills/hermes-verifier/SKILL.md`) teaching Hermes how to

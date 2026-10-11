@@ -204,8 +204,29 @@ unaffected — they are labelled data, not derived from the label.
 run can print both side by side.
 
 Follow-up (same day): excluding inactive (`active=0`) messages — compacted-away
-or rewound rows — narrows the corpus to 289 turns / 22 sessions and the new
+or rewound rows — narrows the corpus to 292 turns / 22 sessions and the new
 label to 23 positives (8.0%). The loop now reports "insufficient data" on this
-corpus (144–145 turns per half against the 150-turn floor), which is the honest
-verdict: it cannot decide anything yet.
+corpus, which is the honest verdict: it cannot decide anything yet.
+
+**WHICH MINIMUM IS ACTUALLY SHORT — do not read this as "nearly there".** The
+split requires, per half, ≥8 sessions AND ≥150 turns AND ≥50 POSITIVE LABELS.
+Measured on this corpus:
+
+| per half | have | need | short by |
+|---|---|---|---|
+| sessions | ~11 | 8 | satisfied |
+| turns | ~146 | 150 | **4** |
+| positive labels | ~11 | 50 | **39** ← the binding constraint |
+
+Positives are short by roughly **4×**: a valid split needs ~100 positive labels
+and the corpus has 23. An earlier version of this note blamed the 150-turn floor
+and quoted "144–145 turns per half", which understated the gap badly — a reader
+could conclude a few more turns would unlock decisions. They would not. Adding
+turns does not add positives; at an ~8% positive rate, reaching ~100 positives
+means on the order of a thousand further turns of real work *with the labels
+reviewed*, since the label is an inferred proxy (see §5) and not ground truth.
+
+This is also why the loop must stay advisory: no candidate can be adopted from
+this corpus at any threshold, and no amount of tuning changes that. The binding
+resource is labelled data, not statistics.
 
