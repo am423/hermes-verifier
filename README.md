@@ -200,6 +200,25 @@ completions that returned no payload — those are retried once, then surfaced i
 `last_error`. A rising empty count with a flat review count means the advisor model
 is not answering, not that it found nothing.
 
+## Disclosure
+
+When enabled, every primary turn's transcript delta (regex-redacted, up to 20,000
+chars) plus any VERIFIER.md/VERIFIER.yml review briefs found from the working
+directory up to the repo root are sent to the verifier model's provider on your
+normal billing (one or more calls per turn per roster entry); a tool-granted advisor
+can read files through Hermes's read_file/search_files; a project VERIFIER.yml can
+add named verifiers and instructions whose findings are injected into your session
+and can keep a coding turn going; findings, reasoning and short delta excerpts are
+kept in HERMES_HOME/plugin-data/hermes-verifier/*.jsonl; adds a dashboard API and a
+Desktop Verifier page. No telemetry, no shell, no stored credentials.
+
+Additionally, from v0.4.0 — *added by the plugin authors, covering what the merge
+disclosure predates:* the engagement gate (off by default) sends a bounded digest
+(≤1,500 chars) to decide whether a turn is reviewed; the phase gate (off by default)
+sends a bounded excerpt of an impending high-risk tool call's **redacted** arguments;
+both write decisions to jsonl under the same directory; JSONL logs rotate at 8 MB
+keeping one `.1` generation.
+
 ## License
 
 MIT
