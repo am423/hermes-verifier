@@ -189,24 +189,17 @@ def test_the_block_schema_matches_the_host_contract(ctx, monkeypatch):  # noqa: 
     )
 
 
-def test_a_command_that_only_MENTIONS_a_risky_phrase_is_not_gated():
-    """Match the COMMAND, not text it merely mentions.
+def test_risky_search_patterns_are_conservatively_reviewed():
+    """Do not trade a quoted-code bypass for fewer mention-only reviews.
 
-    Observed live: `grep -rn 'git push' docs/` was flagged risk=external because
-    the pattern string inside the quotes contained 'git push'. Harmless -- the
-    gate allowed it -- but every such command pays for a model call it does not
-    need, and a reviewer that fires on prose about actions is noise.
-
-    Only SINGLE-quoted spans are stripped. The args arrive JSON-dumped, so the
-    whole command sits inside double quotes; stripping those would erase the
-    real command too and lose every true positive. Verified: stripping double
-    quotes turns 'terminal {"command": "git push origin main"}' into
-    'terminal { :  }'.
+    The phrase trigger is not a shell parser. Review a matching search pattern
+    too, and let the reviewer allow it, rather than deleting quoted bodies that
+    a shell, interpreter or database client can execute.
     """
     assert runtime._action_is_high_risk(
-        "terminal", {"command": "grep -rn 'git push' docs/"}) is None
+        "terminal", {"command": "grep -rn 'git push' docs/"}) == "external"
     assert runtime._action_is_high_risk(
-        "terminal", {"command": "rg 'drop table' src/"}) is None
+        "terminal", {"command": "rg 'drop table' src/"}) == "irreversible"
     assert runtime._action_is_high_risk(
         "terminal", {"command": "grep -c 'deploy' README.md"}) is None
 
