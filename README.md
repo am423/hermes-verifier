@@ -127,6 +127,30 @@ capability is **off by default**, so the zero-config behavior is unchanged.
 | `agreement_reviews` | `1` | Run each review this many times; deliver a finding only when `agreement_min` of the runs raise it. Costs that many times the review price. |
 | `agreement_min` | `1` | How many of `agreement_reviews` must raise a finding for it to be delivered. Set equal for the strictest filter. |
 
+### Brief safety and phase-gate limits
+
+Top-level `VERIFIER.md`, `VERIFIER.yml` and `VERIFIER.yaml` files, and their
+`@path` imports, share a confined reader. Resolved paths must stay inside the
+project discovery root (or `HERMES_HOME` for user-level files). The reader rejects
+non-regular files, caps each file at 256 KiB, and consults Hermes's file-read safety
+policy. When no repository is found, discovery stops at the login home directory;
+outside that home, it checks only the working directory plus user-level files.
+
+The optional phase gate is a conservative phrase trigger, not a shell parser or
+security sandbox. Quoted shell and SQL bodies remain visible to it. A search that
+merely mentions a risky action can therefore trigger review too; the reviewer can
+allow it. Quoting must not hide an executable action from review.
+
+### Development scripts
+
+The development/evaluation directories are opt-in and not imported by the plugin
+runtime. Direct provider experiments require an explicitly supplied
+`DEEPSEEK_API_KEY` in the process environment; they do not read Hermes credential
+stores. Codex evaluations delegate authentication and transport to Hermes's CLI.
+Offline analysis resolves the active profile through `get_hermes_home()` and reads
+session data only when explicitly run. See [development authentication and
+validation](evals/DEVELOPMENT.md) for details and network/billing implications.
+
 ## Repository layout (the repo root IS the installable package)
 
 ```
@@ -145,7 +169,7 @@ hermes-verifier/               ← install root (~/.hermes/plugins/hermes-verifi
 ├── desktop/
 │   └── plugin.js              ← Verifier Mode page (route /verifier)
 ├── skills/hermes-verifier/SKILL.md
-├── tests/                     ← 304 tests: guard, delta, runtime, roster, backlog,
+├── tests/                     ← guard, delta, runtime, roster, backlog,
 │                                budget, nudge, advisor tools, gaps, events
 ├── pytest.ini                 ← importlib mode: keeps pytest off the hyphenated root package
 ├── docs/design.md             ← full architecture and behavior spec
@@ -174,9 +198,8 @@ Or use the one-click install link from the Hermes desktop app:
 hermes://plugin/install?repo=am423/hermes-verifier&enable=1
 ```
 
-(The repo is private, so the link works for the owner only until it is made
-public. The probe detects both halves at the repo root: agent via
-`plugin.yaml` + `__init__.py`, desktop via `desktop/plugin.js`.)
+The probe detects both halves at the repo root: agent via `plugin.yaml` +
+`__init__.py`, desktop via `desktop/plugin.js`.
 
 ## Activating
 
@@ -188,8 +211,8 @@ public. The probe detects both halves at the repo root: agent via
 ## Status
 
 All four milestones are implemented: verifier runtime, backend API, Verifier Mode UI,
-and roster/briefs. The desktop half ships opt-in — enable it in Settings → Plugins
-after a gateway restart.
+and roster/briefs. The desktop half ships opt-in — enable its Desktop switch in
+Capabilities → Plugins. Settings → Plugins opens the configuration form.
 
 ### Confirming the advisor is engaging
 

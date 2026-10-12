@@ -26,6 +26,8 @@ jobs:
         run: pip install pytest pyyaml
       - name: Run tests
         run: python -m pytest -q
+      - name: Run offline analysis tests
+        run: python -m pytest -q autoresearch/tests
       - name: Validate plugin (the catalog admission gate)
         # validate exits non-zero on error by itself; --ci is a doctor flag.
         run: hermes plugins validate . --install-deps
