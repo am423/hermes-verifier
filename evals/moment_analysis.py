@@ -19,9 +19,12 @@ from __future__ import annotations
 import pathlib
 import re
 import sqlite3
+import sys
 from typing import Any, Dict, List
 
-DB = pathlib.Path.home() / ".hermes" / "state.db"
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from autoresearch.paths import get_hermes_home  # noqa: E402
+
 SESSION = "20261010_003202_ad2365"
 
 # ---------------------------------------------------------------------------
@@ -82,8 +85,11 @@ COMPLETION_CLAIM = re.compile(
     r"is\s+now\s+live|deployed|shipped|no\s+bugs|clean)\b", re.I)
 
 
-def load_turns() -> List[Dict[str, Any]]:
-    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+def load_turns(db: pathlib.Path | None = None) -> List[Dict[str, Any]]:
+    """Read session data from the current profile, never credential stores."""
+    if db is None:
+        db = get_hermes_home() / "state.db"
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     rows = list(con.execute(
         "select role, content, tool_calls, tool_name, timestamp from messages "

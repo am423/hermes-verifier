@@ -131,18 +131,30 @@ an instruct model a concrete question and lets it reason.
 
 ## 4. Rebuilding the numbers
 
-`sidecar/.venv` holds torch + transformers for the d1-omni experiments. The three
-scripts worth keeping need only `urllib` (stdlib) and a `DEEPSEEK_API_KEY` in
-`~/.hermes/.env`:
+The retained provider experiments need only `urllib` (stdlib) and a
+`DEEPSEEK_API_KEY` supplied in the **process environment**. They share
+`llm_gate.load_key()`, which never opens Hermes credential stores or loads an
+environment file. A missing or blank key fails explicitly before any request.
+Launching these experiments sends requests to the public DeepSeek API and may
+incur charges; they are not part of the offline unit suite.
+
+From the repository root, with the key already supplied securely by the
+launching environment:
 
 ```bash
-cd sidecar && /opt/anaconda3/bin/python3 llm_gate_heldout.py
-cd sidecar && /opt/anaconda3/bin/python3 llm_gate_fresh3.py
+python sidecar/llm_gate.py
+python sidecar/llm_gate_heldout.py
+python sidecar/llm_gate_fresh3.py
 ```
 
-Expected: `wrongly skipped 0/9 SAFE`, `down-tiered 0/9 SAFE` on both. The published
-case sets are deliberately weighted toward dangerous-actions-that-look-routine —
-the direction a gate actually fails in.
+The consequence and tool-protocol probes use the same environment-only key
+loader. See [development authentication](../evals/DEVELOPMENT.md) for the
+host-owned CLI route used by Codex evals and the offline regression checks.
+
+Historical result on each of the held-out and fresh sets: `wrongly skipped 0/9
+SAFE`, `down-tiered 0/9 SAFE`. These figures are not a new provider run for the
+credential change. The published case sets are deliberately weighted toward
+dangerous-actions-that-look-routine — the direction a gate actually fails in.
 
 ---
 

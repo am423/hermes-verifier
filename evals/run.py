@@ -12,8 +12,13 @@ Recall alone cannot rank configs -- a reviewer that flags everything catches
 everything. Both halves are always reported.
 
 Usage:
-    python evals/run.py --configs baseline,nofiles --model deepseek/deepseek-flash
+    python evals/run.py --configs baseline,notools --model deepseek/deepseek-flash
+    python evals/run.py --provider cli --cli-provider openai-codex --model MODEL
     python evals/run.py --list
+
+Direct DeepSeek runs require DEEPSEEK_API_KEY in the process environment. These
+scripts never load Hermes credential stores. Codex is available only through
+the host-owned Hermes CLI; see DEVELOPMENT.md for the authentication boundary.
 """
 
 from __future__ import annotations
@@ -185,11 +190,11 @@ def _tools_block(max_calls: int, nudge: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 def _key(env_name: str) -> str:
-    p = pathlib.Path.home() / ".hermes" / ".env"
-    for line in p.read_text().splitlines():
-        if line.startswith(env_name + "="):
-            return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return os.environ.get(env_name, "")
+    """Use only an explicitly supplied environment key, never a host store."""
+    key = os.environ.get(env_name, "")
+    if not key.strip():
+        raise RuntimeError(f"{env_name} is required in the process environment")
+    return key
 
 
 COMPLETER = None      # set in main(); keeps run_case callable from tests
@@ -221,58 +226,6 @@ def _complete_deepseek(messages, model: str, max_tokens: int = 1500) -> dict:
     return {"text": msg.get("content") or "", "usage": payload.get("usage") or {}}
 
 
-def complete_codex_direct(messages, model: str = "gpt-6.1-sol") -> dict:
-    """A BARE codex completion -- no agent scaffolding.
-
-    Running the reviewer as a CLI agent turn made BOTH model families flag every
-    clean case (recall 100%, false alarms 6/6, identically), so the CLI measured
-    the framing rather than the model. This path sends the same messages the
-    deepseek arm sends, through codex's Responses API, so the MODEL is the only
-    variable.
-
-    Auth comes from Hermes's own store; token values are never logged.
-    """
-    auth = json.loads((pathlib.Path.home() / ".hermes" / "auth.json").read_text())
-    codex = auth["providers"]["openai-codex"]
-    token = codex["tokens"]["access_token"]
-    account = codex["tokens"]["account_id"]
-
-    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
-    user = "\n\n".join(m["content"] for m in messages if m["role"] != "system")
-    body = json.dumps({
-        "model": model,
-        "instructions": system,
-        "input": [{"type": "message", "role": "user",
-                   "content": [{"type": "input_text", "text": user}]}],
-        "stream": True,
-        "store": False,
-    }).encode()
-    req = urllib.request.Request(
-        "https://chatgpt.com/backend-api/codex/responses", data=body,
-        headers={"Authorization": f"Bearer {token}",
-                 "chatgpt-account-id": account,
-                 "Content-Type": "application/json",
-                 "OpenAI-Beta": "responses=experimental"})
-    text_parts, usage = [], {}
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        for raw in resp:
-            line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
-                continue
-            try:
-                ev = json.loads(line[5:].strip())
-            except json.JSONDecodeError:
-                continue
-            kind = ev.get("type")
-            if kind == "response.output_text.delta":
-                text_parts.append(ev.get("delta") or "")
-            elif kind == "response.completed":
-                u = (ev.get("response") or {}).get("usage") or {}
-                usage = {"prompt_tokens": u.get("input_tokens", 0),
-                         "completion_tokens": u.get("output_tokens", 0)}
-    return {"text": "".join(text_parts), "usage": usage}
-
-
 def complete_cli(messages, model: str, provider: str) -> dict:
     """One reviewer completion through a pinned CLI turn.
 
@@ -283,6 +236,9 @@ def complete_cli(messages, model: str, provider: str) -> dict:
 
     Known limitation of this path: token usage is not reported back, so COST is
     unavailable -- a comparison drawn here ranks quality only.
+
+    The host owns provider authentication, token refresh and transport. This
+    harness passes only prompts and routing options, never stored credentials.
     """
     body = "\n\n".join(m["content"] for m in messages)
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
@@ -337,9 +293,13 @@ def parse_envelope(text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def dispatch(tool: str, args: dict, workspace: pathlib.Path) -> str:
+    """Read only the materialised case, not arbitrary host/profile files."""
     try:
+        workspace = workspace.resolve()
         if tool == "read_file":
-            target = workspace / str(args.get("path", ""))
+            target = (workspace / str(args.get("path", ""))).resolve()
+            if not target.is_relative_to(workspace):
+                return "[error] path outside case workspace"
             if not target.is_file():
                 return f"[error] no such file: {args.get('path')}"
             return target.read_text(errors="replace")[:1500]
@@ -347,6 +307,8 @@ def dispatch(tool: str, args: dict, workspace: pathlib.Path) -> str:
             needle = str(args.get("pattern", ""))
             hits = []
             for f in sorted(workspace.glob("**/*")):
+                if not f.resolve().is_relative_to(workspace):
+                    continue
                 if f.is_file() and needle and needle in f.read_text(errors="replace"):
                     hits.append(str(f.name))
             return "\n".join(hits) or "[no matches]"
@@ -520,7 +482,7 @@ def main() -> None:
     ap.add_argument("--configs", default="baseline")
     ap.add_argument("--model", default="deepseek/deepseek-flash")
     ap.add_argument("--provider", default="deepseek",
-                    choices=("deepseek", "codex", "cli"),
+                    choices=("deepseek", "cli"),
                     help="cli runs EVERY arm through a pinned CLI turn so the "
                          "model is the only variable")
     ap.add_argument("--cli-provider", default="deepseek",
@@ -542,11 +504,15 @@ def main() -> None:
         return
 
     global COMPLETER
-    if args.provider == "codex":
-        COMPLETER = lambda msgs, mdl: complete_codex_direct(msgs, mdl)
+    COMPLETER = None
     if args.provider == "cli":
         COMPLETER = lambda msgs, mdl: complete_cli(msgs, args.model,
                                                    args.cli_provider)
+    else:
+        try:
+            _key("DEEPSEEK_API_KEY")
+        except RuntimeError as exc:
+            ap.error(str(exc))
 
     all_cases = case_mod.all_cases()
     names = [n.strip() for n in args.configs.split(",") if n.strip()]

@@ -8,6 +8,10 @@ A "turn" starts at a user message and runs until the next one. The outcome label
 (`repair_next`) is computed from the FOLLOWING turn's assistant PROSE only;
 `repair_next_any` keeps the older, broad reading (prose + tool args + tool
 results) so the two can be compared.
+
+Default inputs follow the active Hermes profile via get_hermes_home(), resolved
+when called. This offline analysis reads only decision logs and the session DB;
+it does not load provider credentials or call a model.
 """
 
 from __future__ import annotations
@@ -17,10 +21,8 @@ import pathlib
 import sqlite3
 from typing import Any, Dict, List
 
+from .paths import get_hermes_home
 from .rules import FAILURE, REPAIR
-
-DEFAULT_DATA = pathlib.Path.home() / ".hermes" / "plugin-data" / "hermes-verifier"
-DEFAULT_DB = pathlib.Path.home() / ".hermes" / "state.db"
 
 
 def read_decisions(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
@@ -57,8 +59,10 @@ def read_decisions(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
     return out
 
 
-def load_turns(db: pathlib.Path = DEFAULT_DB) -> List[Dict[str, Any]]:
+def load_turns(db: pathlib.Path | None = None) -> List[Dict[str, Any]]:
     """Segment every substantial session into turns, with outcome labels."""
+    if db is None:
+        db = get_hermes_home() / "state.db"
     if not db.exists():
         return []
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -115,14 +119,20 @@ def load_turns(db: pathlib.Path = DEFAULT_DB) -> List[Dict[str, Any]]:
     return out
 
 
-def harvest(data_dir: pathlib.Path = DEFAULT_DATA,
-            db: pathlib.Path = DEFAULT_DB) -> List[Dict[str, Any]]:
+def harvest(data_dir: pathlib.Path | None = None,
+            db: pathlib.Path | None = None) -> List[Dict[str, Any]]:
     """Turns, with the decisions made ON each turn attached.
 
     Attaching every decision of a session to every turn of that session (what
     this used to do) copied the same rows onto all 118 turns of a session and
     made any join meaningless.
     """
+    if data_dir is None or db is None:
+        home = get_hermes_home()
+        if data_dir is None:
+            data_dir = home / "plugin-data" / "hermes-verifier"
+        if db is None:
+            db = home / "state.db"
     turns = load_turns(db)
     decisions = read_decisions(data_dir)
     by_turn: Dict[tuple, List[Dict[str, Any]]] = {}

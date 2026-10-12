@@ -9,6 +9,10 @@ The candidate is the provider already configured for the advisor: no new model,
 no download, no sidecar, no GPU. One short call per turn via ctx.llm, which the
 plugin already uses. Cost is bounded by a small prompt and a tiny max_tokens.
 
+This standalone experiment uses the public DeepSeek API instead of ctx.llm.
+It requires DEEPSEEK_API_KEY in the process environment and never loads Hermes
+credential stores. All sidecar provider experiments share load_key() below.
+
 Measured here on the same 10 labelled cases. The numbers that matter:
   WRONGLY SKIPPED   -- dangerous action the gate would skip (must be 0)
   DOWN-TIERED       -- dangerous action given the cheap review (must be 0)
@@ -18,7 +22,6 @@ from __future__ import annotations
 
 import json
 import os
-import pathlib
 import re
 import urllib.request
 
@@ -52,12 +55,11 @@ SCHEMA_HINT = '{"engage": bool, "effort": "routine"|"deep"}'
 
 
 def load_key() -> str:
-    """Read the provider key from the Hermes env file. Never printed."""
-    p = pathlib.Path(os.path.expanduser("~/.hermes/.env"))
-    for line in p.read_text().splitlines():
-        if line.startswith("DEEPSEEK_API_KEY="):
-            return line.split("=", 1)[1].strip().strip('"').strip("'")
-    raise SystemExit("DEEPSEEK_API_KEY not found")
+    """Require an explicitly supplied environment key; never consult a store."""
+    key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not key.strip():
+        raise SystemExit("DEEPSEEK_API_KEY is required in the process environment")
+    return key
 
 
 def ask(key: str, action: str, model: str = "deepseek-flash") -> dict:
