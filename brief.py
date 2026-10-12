@@ -6,11 +6,11 @@ context. ``VERIFIER.yml`` declares the verifier roster: one entry per name,
 each with its own enable flag, model, tool grant, and specialization prompt.
 
 Discovery loads the user-level file first, then project files while walking
-from the working directory up to the git repository root (or the home
-directory when no repo root is found), mirroring how project context files are
-discovered but without stopping at the nearest file. For roster entries with
-duplicate slugs, more-specific files (project leaf > project ancestor > user)
-replace earlier entries.
+from the working directory up to the git repository root (or the login home
+when no repo root is found; only cwd when outside home), mirroring how project
+context files are discovered but without stopping at the nearest file. For
+roster entries with duplicate slugs, more-specific files (project leaf >
+project ancestor > user) replace earlier entries.
 
 Only the standard library is imported at module level: this package is loaded
 inside the Hermes plugin harness and must stay import-light.
@@ -21,8 +21,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger("hermes-verifier")
 
@@ -82,49 +83,111 @@ def _ancestor_chain(start: Path, anchor: Path) -> List[Path]:
     Stops at the discovery anchor (repo root or home). Ordered farthest-first
     so callers get user/broad guidance before project/narrow guidance.
     """
+    if not _within(start, anchor):
+        return []
     chain: List[Path] = []
     current = start
     for _ in range(64):
-        if current == anchor.parent:
-            break
         chain.append(current)
-        if current == current.parent:
+        if current == anchor or current == current.parent:
             break
         current = current.parent
     chain.reverse()
     return chain
 
 
-def _discovery_anchor(start: Path, user_home: Path) -> Path:
-    return _find_repo_root(start) or user_home
+def _discovery_anchor(start: Path) -> Path:
+    repo = _find_repo_root(start)
+    if repo is not None:
+        return repo
+    # user_home is HERMES_HOME, not the login home. If cwd is outside HOME,
+    # inspect only cwd instead of accidentally walking all the way up to /.
+    home = Path.home().resolve()
+    return home if _within(start, home) else start
 
 
-def _candidates(start: Path, user_home: Path, names: List[str]) -> List[Path]:
-    """Ordered candidate files: user-level first, then ancestors down to cwd.
+def _candidates(start: Path, user_home: Path,
+                names: List[str]) -> List[Tuple[Path, Path]]:
+    """Ordered (candidate, confinement root) pairs, user then ancestors to cwd.
 
     Mirrors the "broad guidance first, narrow guidance last" prompt ordering
     so project files closer to the working directory land nearest the end of
     the system prompt. For roster files, later files override earlier entries
     with the same slug.
     """
-    anchor = _discovery_anchor(start, user_home)
-    out: List[Path] = []
+    start, user_home = start.resolve(), user_home.resolve()
+    anchor = _discovery_anchor(start)
+    out: List[Tuple[Path, Path]] = []
     for name in names:
-        out.append(user_home / name)
+        out.append((user_home / name, user_home))
     for directory in _ancestor_chain(start, anchor):
         for name in names:
-            out.append(directory / name)
-            out.append(directory / ".hermes" / name)
+            for candidate in (directory / name, directory / ".hermes" / name):
+                # HERMES_HOME may itself sit in an enclosing git repo. Do not
+                # widen its bound on a second encounter, including via a parent
+                # directory alias. Resolve the parent only to NARROW the bound;
+                # never use the entry's symlink destination to grant a root.
+                root = anchor
+                try:
+                    if (_within(user_home, anchor)
+                            and _within(candidate.parent.resolve(), user_home)):
+                        root = user_home
+                except (OSError, RuntimeError):
+                    continue
+                out.append((candidate, root))
     return out
 
 
-def _read_candidate(candidate: Path) -> Optional[str]:
+def _read_candidate(candidate: Path, root: Path) -> Optional[str]:
+    """Read a confined, regular prompt source with a bounded binary read.
+
+    Shared by top-level briefs, rosters and imports: none may bypass the host's
+    read policy or rebase its confinement on a symlink's destination.
+    """
     try:
-        if not candidate.is_file():
+        resolved = candidate.resolve()
+        if not _within(resolved, root.resolve()):
+            logger.warning("%s resolves outside %s; skipped", candidate, root)
             return None
-        text = candidate.read_text(encoding="utf-8", errors="replace").strip()
-        return text or None
-    except OSError as exc:  # pragma: no cover - permission races
+        metadata = resolved.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            logger.warning("%s is not a regular file; skipped", candidate)
+            return None
+        if metadata.st_size > _MAX_IMPORT_BYTES:
+            logger.warning("%s exceeds the %d byte cap; skipped", candidate, _MAX_IMPORT_BYTES)
+            return None
+        try:
+            from agent.file_safety import get_read_block_error
+        except ImportError:  # outside Hermes (standalone use / tests)
+            pass
+        else:
+            try:
+                blocked = get_read_block_error(str(resolved))
+            except Exception:
+                logger.warning("file safety check failed for %s; skipped", candidate)
+                return None
+            if blocked:
+                logger.warning("%s refused by file safety: %s", candidate, blocked)
+                return None
+        # A file can change after stat. Do not block on a replacement FIFO or
+        # follow a replacement final symlink; validate the opened descriptor too.
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(resolved, flags)
+        try:
+            opened = os.fstat(fd)
+            if (not stat.S_ISREG(opened.st_mode)
+                    or opened.st_size > _MAX_IMPORT_BYTES
+                    or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)):
+                return None
+            with os.fdopen(fd, "rb", closefd=False) as source:
+                data = source.read(_MAX_IMPORT_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(data) > _MAX_IMPORT_BYTES:
+            logger.warning("%s grew beyond the %d byte cap; skipped", candidate, _MAX_IMPORT_BYTES)
+            return None
+        return data.decode("utf-8", errors="replace").strip()
+    except (OSError, RuntimeError) as exc:  # unreadable, missing or symlink loop
         logger.debug("skipping %s: %s", candidate, exc)
         return None
 
@@ -137,8 +200,8 @@ _IMPORT_LINE = re.compile(r"^@([^\s`\"'<>]+)\s*$")
 _FENCE = re.compile(r"^```|^~~~")
 
 
-# A brief file is prompt text, not data. Anything larger is a mistake, and
-# reading it would be paid for on every turn.
+# Every discovered/imported file is prompt text, not data. Anything larger is
+# a mistake, and reading it would be paid for on every turn.
 _MAX_IMPORT_BYTES = 256 * 1024
 
 
@@ -158,20 +221,19 @@ def _within(path: Path, root: Path) -> bool:
 def _import_root(entry: Optional[Path], base_dir: Path) -> Path:
     """The directory an ``@import`` may not escape.
 
-    The importing file's repo root when it sits in one, else its own directory --
-    which is HERMES_HOME for the user-level VERIFIER.md. Without a bound a cloned
-    repo's VERIFIER.md could ``@path`` to ``~/.ssh/id_rsa`` (or any absolute or
-    ``..`` path) and the content went to the verifier's provider.
+    Use the entry's lexical location, never its symlink destination, to find
+    the repo root (else its own directory). Discovery additionally clamps this
+    to its explicit bound, notably HERMES_HOME even inside a larger repo.
     """
     try:
-        anchor = Path(entry).resolve().parent if entry else Path(base_dir).resolve()
+        anchor = Path(entry).absolute().parent if entry else Path(base_dir).absolute()
     except OSError:
         anchor = Path(base_dir)
     try:
         repo = _find_repo_root(anchor)
     except Exception:
         repo = None
-    return repo or anchor
+    return (repo or anchor).resolve()
 
 
 def expand_imports(text: str, base_dir: Path, seen: Optional[set] = None,
@@ -200,7 +262,7 @@ def expand_imports(text: str, base_dir: Path, seen: Optional[set] = None,
         # been walked from the top, so A expanded a second time underneath B.
         try:
             seen.add(Path(entry).resolve())
-        except OSError:
+        except (OSError, RuntimeError):
             seen.add(Path(entry))
     out: List[str] = []
     in_fence = False
@@ -220,54 +282,32 @@ def expand_imports(text: str, base_dir: Path, seen: Optional[set] = None,
         target = Path(raw).expanduser() if raw.startswith("~") else (base_dir / raw)
         try:
             target = target.resolve()
-        except OSError:
+        except (OSError, RuntimeError):
             out.append(line)
             continue
         if target in seen:
             out.append(line)
             continue
-        try:
-            stat = target.stat()
-        except OSError:
-            out.append(line)  # missing import stays literal
-            continue
-        if not target.is_file():
-            # A FIFO, device or socket would BLOCK read_text() and stall roster
-            # discovery -- i.e. the session. Only regular files are imports.
-            logger.warning("@import %s is not a regular file; left literal", raw)
-            out.append(line)
-            continue
-        if stat.st_size > _MAX_IMPORT_BYTES:
-            logger.warning("@import %s is %d bytes (cap %d); left literal",
-                           raw, stat.st_size, _MAX_IMPORT_BYTES)
-            out.append(line)
-            continue
-        # Confine to the importing file's root BEFORE reading. `target` is already
-        # resolved, so a symlink whose own name looks contained is caught here.
-        if not _within(target, root):
-            logger.warning("@import %s resolves outside %s; left literal", raw, root)
-            out.append(line)
-            continue
-        # And defer to the host's own read policy when it exists, so a path this
-        # plugin would allow but Hermes would refuse is refused here too.
-        try:
-            from agent.file_safety import get_read_block_error
-            blocked = get_read_block_error(str(target))
-        except Exception:
-            blocked = None
-        if blocked:
-            logger.warning("@import %s refused by file safety: %s", raw, blocked)
-            out.append(line)
-            continue
-        try:
-            imported = target.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            out.append(line)  # missing import stays literal
+        imported = _read_candidate(target, root)
+        if imported is None:
+            out.append(line)  # missing, unreadable or refused import stays literal
             continue
         seen.add(target)
         out.append(expand_imports(imported, target.parent, seen, depth + 1,
                                   root=root))
     return "\n".join(out)
+
+
+def _expanded_candidates(start: Path, home: Path, names: List[str]) -> Iterator[str]:
+    """Use the same discovery/read/import bounds for briefs and rosters."""
+    for candidate, root in _candidates(start, home, names):
+        text = _read_candidate(candidate, root)
+        if not text:
+            continue
+        import_root = _import_root(candidate, candidate.parent)
+        if not _within(import_root, root):
+            import_root = root
+        yield expand_imports(text, candidate.parent, entry=candidate, root=import_root)
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +327,7 @@ def load_brief_blocks(start_dir: Optional[Path] = None,
         start = Path(os.getcwd())
 
     blocks: List[str] = []
-    for candidate in _candidates(start, home, ["VERIFIER.md"]):
-        text = _read_candidate(candidate)
-        if text is None:
-            continue
-        expanded = expand_imports(text, candidate.parent, entry=candidate)
+    for expanded in _expanded_candidates(start, home, ["VERIFIER.md"]):
         blocks.append(f"{ATTENTION_HEADER}\n{expanded}\n{ATTENTION_FOOTER}")
     return blocks
 
@@ -394,11 +430,7 @@ def load_roster(start_dir: Optional[Path] = None,
         start = Path(os.getcwd())
 
     merged: Dict[str, Dict[str, object]] = {}
-    for candidate in _candidates(start, home, ["VERIFIER.yml", "VERIFIER.yaml"]):
-        text = _read_candidate(candidate)
-        if text is None:
-            continue
-        expanded = expand_imports(text, candidate.parent, entry=candidate)
+    for expanded in _expanded_candidates(start, home, ["VERIFIER.yml", "VERIFIER.yaml"]):
         for entry in _parse_roster_file(expanded):
             slug = str(entry["slug"])
             merged[slug] = entry  # later (more specific) wins
