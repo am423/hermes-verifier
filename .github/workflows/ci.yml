@@ -23,7 +23,7 @@ jobs:
           bash /tmp/hermes-install.sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install test deps
-        run: pip install pytest pyyaml
+        run: python -m pip install pytest pyyaml jsonschema
       - name: Run tests
         run: python -m pytest -q
       - name: Run offline analysis tests
