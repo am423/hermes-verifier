@@ -832,7 +832,11 @@ def _review_agreeing(state: SessionVerifier, verifier: Verifier, delta_text: str
 
 
 # Session memory: the verifier sees its own earlier findings for this session.
-_PRIOR_FINDINGS_MAX = 8
+# Keep the session's FIRST findings as well as the most recent ones: in a long session a
+# recent-only window drops early findings, and the agent may still refer to them.
+_PRIOR_FINDINGS_FIRST = 3
+_PRIOR_FINDINGS_RECENT = 12
+_PRIOR_FINDINGS_MAX = _PRIOR_FINDINGS_FIRST + _PRIOR_FINDINGS_RECENT
 
 
 def _prior_findings_block(state: "SessionVerifier", verifier: "Verifier") -> str:
@@ -854,15 +858,20 @@ def _prior_findings_block(state: "SessionVerifier", verifier: "Verifier") -> str
                 continue
             if rec.get("accepted") and rec.get("severity") in ("note", "caution", "blocker"):
                 rows.append(rec)
-        rows = rows[-_PRIOR_FINDINGS_MAX:]
         if not rows:
             return ""
+        omitted = 0
+        if len(rows) > _PRIOR_FINDINGS_MAX:
+            omitted = len(rows) - _PRIOR_FINDINGS_MAX
+            rows = rows[:_PRIOR_FINDINGS_FIRST] + rows[-_PRIOR_FINDINGS_RECENT:]
         lines = [
             "Your earlier findings in THIS session (already delivered to the primary agent). "
             "Context only: do not repeat a finding that was already addressed, and do not treat "
             "the agent mentioning one of these as an invented claim."
         ]
-        for rec in rows:
+        for i, rec in enumerate(rows):
+            if omitted and i == _PRIOR_FINDINGS_FIRST:
+                lines.append(f"- ({omitted} older findings omitted)")
             text = " ".join(str(rec.get("finding", "")).split())[:300]
             lines.append(f"- turn {rec.get('origin_turn', '?')} [{rec.get('severity')}]: {text}")
         return "\n".join(lines)

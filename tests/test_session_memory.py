@@ -54,9 +54,22 @@ def test_only_accepted_real_findings_are_kept_and_capped(ctx):  # noqa: F811
     _write("s1", rows)
     state, verifier = _state("s1")
     lines = runtime._prior_findings_block(state, verifier).splitlines()[1:]
-    assert len(lines) == runtime._PRIOR_FINDINGS_MAX
-    assert "f11" in lines[-1] and "f4" in lines[0]
-    assert not any("rejected" in l or "nothing" in l for l in lines)
+    assert len(lines) == 12  # 12 accepted findings fit under the cap; rejected/none/bad dropped
+    assert "f0" in lines[0] and "f11" in lines[-1]
+    assert not any("rejected" in l or "nothing" in l or "omitted" in l for l in lines)
+
+
+def test_a_long_session_keeps_its_first_and_latest_findings(ctx):  # noqa: F811
+    _write("s1", [{"accepted": True, "severity": "caution", "finding": f"f{i}", "origin_turn": i}
+                  for i in range(30)])
+    state, verifier = _state("s1")
+    lines = runtime._prior_findings_block(state, verifier).splitlines()[1:]
+    first, recent = runtime._PRIOR_FINDINGS_FIRST, runtime._PRIOR_FINDINGS_RECENT
+    assert len(lines) == first + recent + 1  # plus the "omitted" marker
+    assert [l.split(": ", 1)[1] for l in lines[:first]] == [f"f{i}" for i in range(first)]
+    assert lines[first] == f"- ({30 - first - recent} older findings omitted)"
+    assert lines[-1].endswith(": f29")
+    assert lines[first + 1].endswith(f": f{30 - recent}")
 
 
 def test_an_unreadable_log_never_breaks_memory(ctx, tmp_path):  # noqa: F811
