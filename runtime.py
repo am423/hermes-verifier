@@ -831,6 +831,46 @@ def _review_agreeing(state: SessionVerifier, verifier: Verifier, delta_text: str
                         delta_excerpt=delta_text, origin_turn=origin_turn)
 
 
+# Session memory: the verifier sees its own earlier findings for this session.
+_PRIOR_FINDINGS_MAX = 8
+
+
+def _prior_findings_block(state: "SessionVerifier", verifier: "Verifier") -> str:
+    """This session's earlier accepted findings from this verifier, for context only.
+
+    Read from the per-session JSONL log, so a new session starts empty. Without this the
+    verifier only sees the newest delta and can wrongly accuse the agent of inventing a
+    finding it raised itself a few turns ago.
+    """
+    try:
+        path = _log_path(state.session_id, verifier.slug)
+        if not path.is_file():
+            return ""
+        rows = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("accepted") and rec.get("severity") in ("note", "caution", "blocker"):
+                rows.append(rec)
+        rows = rows[-_PRIOR_FINDINGS_MAX:]
+        if not rows:
+            return ""
+        lines = [
+            "Your earlier findings in THIS session (already delivered to the primary agent). "
+            "Context only: do not repeat a finding that was already addressed, and do not treat "
+            "the agent mentioning one of these as an invented claim."
+        ]
+        for rec in rows:
+            text = " ".join(str(rec.get("finding", "")).split())[:300]
+            lines.append(f"- turn {rec.get('origin_turn', '?')} [{rec.get('severity')}]: {text}")
+        return "\n".join(lines)
+    except Exception as exc:  # never let memory break a review
+        logger.debug("prior findings block failed: %s", exc)
+        return ""
+
+
 def _review_one_serial(state: SessionVerifier, verifier: Verifier, delta_text: str,
                        effort: str = "deep", origin_turn: int = 0,
                        deliver: bool = True) -> Optional[Dict[str, Any]]:
@@ -844,6 +884,9 @@ def _review_one_serial(state: SessionVerifier, verifier: Verifier, delta_text: s
         system_prompt = brief.build_system_prompt(
             extra_instructions=verifier.shared_instructions + "\n\n" + verifier.instructions
         )
+        prior_block = _prior_findings_block(state, verifier)
+        if prior_block:
+            system_prompt = f"{system_prompt}\n\n{prior_block}"
         # Tools only engage when the operator opts in AND the roster granted some.
         grant = verifier.tool_grant if _config(ctx, "advisor_tools", False) else []
         if grant:
